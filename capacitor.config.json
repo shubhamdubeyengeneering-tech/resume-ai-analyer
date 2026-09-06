@@ -1,0 +1,5 @@
+{
+  "appId": "com.example.app",
+  "appName": "ai-resume-analyzer",
+  "webDir": "dist"
+}
