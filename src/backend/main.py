@@ -7,7 +7,9 @@ from docx import Document
 import io
 import re
 import os
-
+import pytesseract
+from PIL import Image
+pytesseract.pytesseract.tesseract_cmd = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
 from dotenv import load_dotenv
 from google import genai
 
@@ -41,7 +43,6 @@ app.add_middleware(
 # =========================
 # TEXT EXTRACTION
 # =========================
-
 def extract_pdf_text(file_bytes):
 
     text = ""
@@ -53,6 +54,24 @@ def extract_pdf_text(file_bytes):
 
     for page in pdf:
         text += page.get_text()
+
+    # Agar normal PDF text nahi mila, OCR try karo
+    if len(text.strip()) < 100:
+
+        ocr_text = ""
+
+        for page in pdf:
+            pix = page.get_pixmap(dpi=200)
+
+            image = Image.open(
+                io.BytesIO(
+                    pix.tobytes("png")
+                )
+            )
+
+            ocr_text += pytesseract.image_to_string(image)
+
+        text = ocr_text
 
     pdf.close()
 
