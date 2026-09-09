@@ -8,8 +8,8 @@ import io
 import re
 import os
 import pytesseract
-from PIL import Image
-pytesseract.pytesseract.tesseract_cmd = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
+from PIL import Image, ImageOps
+
 from dotenv import load_dotenv
 from google import genai
 
@@ -22,9 +22,28 @@ load_dotenv()
 
 app = FastAPI()
 
-gemini_client = genai.Client(
-    api_key=os.getenv("GEMINI_API_KEY")
-)
+gemini_api_key = os.getenv("GEMINI_API_KEY")
+
+gemini_client = None
+
+if gemini_api_key:
+    gemini_client = genai.Client(
+        api_key=gemini_api_key
+    )
+
+
+# =========================
+# TESSERACT OCR
+# =========================
+
+# Windows
+windows_tesseract = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
+
+if os.path.exists(windows_tesseract):
+    pytesseract.pytesseract.tesseract_cmd = windows_tesseract
+
+# On Render/Linux, Tesseract should be available in PATH
+# through the Docker environment.
 
 
 # =========================
@@ -41,42 +60,105 @@ app.add_middleware(
 
 
 # =========================
-# TEXT EXTRACTION
+# IMAGE OCR
 # =========================
-def extract_pdf_text(file_bytes):
 
-    text = ""
+def extract_image_text(file_bytes):
+
+    image = Image.open(
+        io.BytesIO(file_bytes)
+    )
+
+    image = ImageOps.exif_transpose(image)
+
+    if image.mode != "RGB":
+        image = image.convert("RGB")
+
+    # Keep OCR reasonably fast
+    max_dimension = 2200
+
+    if max(image.size) > max_dimension:
+        image.thumbnail(
+            (max_dimension, max_dimension),
+            Image.Resampling.LANCZOS
+        )
+
+    text = pytesseract.image_to_string(
+        image,
+        config="--psm 6"
+    )
+
+    return text
+
+
+# =========================
+# PDF TEXT + OCR
+# =========================
+
+def extract_pdf_text(file_bytes):
 
     pdf = fitz.open(
         stream=file_bytes,
         filetype="pdf"
     )
 
+    text_parts = []
+
+    # First try normal PDF text extraction.
+    # This is much faster than OCR.
     for page in pdf:
-        text += page.get_text()
+        page_text = page.get_text()
 
-    # Agar normal PDF text nahi mila, OCR try karo
-    if len(text.strip()) < 100:
+        if page_text:
+            text_parts.append(page_text)
 
-        ocr_text = ""
+    normal_text = "\n".join(
+        text_parts
+    ).strip()
 
-        for page in pdf:
-            pix = page.get_pixmap(dpi=200)
+    # Normal text PDF -> return immediately.
+    if len(normal_text) >= 100:
+        pdf.close()
+        return normal_text
 
-            image = Image.open(
-                io.BytesIO(
-                    pix.tobytes("png")
-                )
+    # Scanned/image PDF -> OCR
+    ocr_text = []
+
+    for page in pdf:
+
+        # 150 DPI keeps OCR reasonably fast.
+        pix = page.get_pixmap(
+            dpi=150,
+            alpha=False
+        )
+
+        image = Image.open(
+            io.BytesIO(
+                pix.tobytes("png")
             )
+        )
 
-            ocr_text += pytesseract.image_to_string(image)
+        if image.mode != "RGB":
+            image = image.convert("RGB")
 
-        text = ocr_text
+        page_text = pytesseract.image_to_string(
+            image,
+            config="--psm 6"
+        )
+
+        if page_text:
+            ocr_text.append(page_text)
 
     pdf.close()
 
-    return text
+    return "\n".join(
+        ocr_text
+    )
 
+
+# =========================
+# DOCX TEXT
+# =========================
 
 def extract_docx_text(file_bytes):
 
@@ -86,10 +168,79 @@ def extract_docx_text(file_bytes):
 
     text = []
 
+    # Normal paragraphs
     for paragraph in document.paragraphs:
-        text.append(paragraph.text)
+
+        paragraph_text = paragraph.text.strip()
+
+        if paragraph_text:
+            text.append(
+                paragraph_text
+            )
+
+    # Resume tables
+    for table in document.tables:
+
+        for row in table.rows:
+
+            for cell in row.cells:
+
+                cell_text = cell.text.strip()
+
+                if cell_text:
+                    text.append(
+                        cell_text
+                    )
 
     return "\n".join(text)
+
+
+# =========================
+# TEXT QUALITY CHECK
+# =========================
+
+def text_quality_is_reasonable(text):
+
+    cleaned = re.sub(
+        r"\s+",
+        " ",
+        text
+    ).strip()
+
+    if len(cleaned) < 50:
+        return False
+
+    # Count alphabetic characters.
+    letters = len(
+        re.findall(
+            r"[A-Za-z]",
+            cleaned
+        )
+    )
+
+    # A resume should contain a reasonable amount
+    # of readable alphabetic text.
+    if letters < 30:
+        return False
+
+    # OCR corruption indicator.
+    # If too many strange symbols appear, reject it.
+    strange_chars = len(
+        re.findall(
+            r"[^A-Za-z0-9\s@.,:;()/&+#%\-_'|]",
+            cleaned
+        )
+    )
+
+    if len(cleaned) > 100:
+        strange_ratio = (
+            strange_chars / len(cleaned)
+        )
+
+        if strange_ratio > 0.20:
+            return False
+
+    return True
 
 
 # =========================
@@ -98,38 +249,341 @@ def extract_docx_text(file_bytes):
 
 def looks_like_resume(text):
 
-    text_lower = text.lower()
+    text_lower = re.sub(
+        r"\s+",
+        " ",
+        text.lower()
+    ).strip()
 
-    resume_signals = [
-        "education",
-        "skills",
-        "experience",
-        "work experience",
-        "projects",
-        "project",
-        "internship",
-        "certifications",
-        "achievements",
-        "summary",
-        "objective",
-        "professional summary",
-        "b.tech",
-        "btech",
-        "bachelor",
-        "university",
-        "college",
-        "linkedin",
-        "github",
-        "curriculum vitae"
+    if len(text_lower) < 80:
+        return False
+
+    if not text_quality_is_reasonable(text):
+        return False
+
+    # -------------------------
+    # Clearly non-resume documents
+    # -------------------------
+
+    non_resume_signals = [
+        "marksheet",
+        "mark sheet",
+        "statement of marks",
+        "grade sheet",
+        "marks obtained",
+        "total marks",
+        "subject code",
+        "semester result",
+        "examination result",
+        "academic transcript",
+        "transcript of records",
+        "fee receipt",
+        "payment receipt",
+        "invoice",
+        "purchase order",
+        "bank statement",
+        "admit card",
+        "question paper",
+        "hall ticket",
+        "fee challan",
+        "medical report",
+        "prescription",
+        "laboratory report",
+        "test report"
     ]
 
-    found = sum(
+    negative_score = sum(
         1
-        for signal in resume_signals
+        for signal in non_resume_signals
         if signal in text_lower
     )
 
-    return found >= 3
+    # One very strong document-type signal can be enough
+    # when combined with other obvious result-document terms.
+    strong_non_resume = [
+        "statement of marks",
+        "marks obtained",
+        "total marks",
+        "semester result",
+        "examination result",
+        "academic transcript",
+        "transcript of records",
+        "fee receipt",
+        "payment receipt",
+        "bank statement",
+        "admit card",
+        "question paper"
+    ]
+
+    if any(
+        signal in text_lower
+        for signal in strong_non_resume
+    ):
+        return False
+
+    if negative_score >= 2:
+        return False
+
+    # -------------------------
+    # Resume section categories
+    # -------------------------
+
+    resume_signals = {
+
+        "education": [
+            "education",
+            "academic background",
+            "b.tech",
+            "btech",
+            "bachelor",
+            "bachelors",
+            "degree",
+            "university",
+            "college",
+            "school"
+        ],
+
+        "skills": [
+            "skills",
+            "technical skills",
+            "technologies",
+            "technical expertise",
+            "programming skills"
+        ],
+
+        "experience": [
+            "experience",
+            "work experience",
+            "employment",
+            "professional experience",
+            "work history"
+        ],
+
+        "projects": [
+            "projects",
+            "project experience",
+            "academic projects"
+        ],
+
+        "internship": [
+            "internship",
+            "intern",
+            "industrial training"
+        ],
+
+        "profile": [
+            "summary",
+            "professional summary",
+            "profile",
+            "objective",
+            "career objective",
+            "about me"
+        ],
+
+        "certifications": [
+            "certifications",
+            "certificates",
+            "certification"
+        ],
+
+        "achievements": [
+            "achievements",
+            "awards",
+            "honors",
+            "accomplishments"
+        ],
+
+        "professional_links": [
+            "linkedin",
+            "github",
+            "portfolio"
+        ]
+    }
+
+    categories_found = 0
+
+    for keywords in resume_signals.values():
+
+        if any(
+            keyword in text_lower
+            for keyword in keywords
+        ):
+            categories_found += 1
+
+    # -------------------------
+    # Contact evidence
+    # -------------------------
+
+    email_found = bool(
+        re.search(
+            r"[\w\.-]+@[\w\.-]+\.\w+",
+            text_lower
+        )
+    )
+
+    phone_found = bool(
+        re.search(
+            r"(?:\+91[\s-]?)?[6-9]\d{9}",
+            text_lower
+        )
+    )
+
+    linkedin_found = bool(
+        re.search(
+            r"linkedin(?:\.com)?",
+            text_lower
+        )
+    )
+
+    github_found = bool(
+        re.search(
+            r"github(?:\.com)?",
+            text_lower
+        )
+    )
+
+    contact_found = (
+        email_found
+        or phone_found
+        or linkedin_found
+        or github_found
+    )
+
+    # -------------------------
+    # Technical skill evidence
+    # -------------------------
+
+    technical_terms = [
+        "python",
+        "java",
+        "javascript",
+        "typescript",
+        "c++",
+        "c#",
+        "react",
+        "node.js",
+        "nodejs",
+        "html",
+        "css",
+        "sql",
+        "mongodb",
+        "mysql",
+        "postgresql",
+        "fastapi",
+        "django",
+        "flask",
+        "git",
+        "github",
+        "docker",
+        "aws",
+        "azure",
+        "machine learning",
+        "deep learning",
+        "artificial intelligence",
+        "data analysis",
+        "pandas",
+        "numpy",
+        "tensorflow",
+        "pytorch",
+        "power bi",
+        "excel"
+    ]
+
+    skill_count = sum(
+        1
+        for skill in technical_terms
+        if skill in text_lower
+    )
+
+    # -------------------------
+    # Professional activity evidence
+    # -------------------------
+
+    activity_terms = [
+        "developed",
+        "created",
+        "built",
+        "designed",
+        "implemented",
+        "deployed",
+        "integrated",
+        "programmed",
+        "engineered",
+        "analyzed",
+        "tested",
+        "optimized",
+        "managed",
+        "worked on",
+        "responsible for"
+    ]
+
+    activity_count = sum(
+        1
+        for activity in activity_terms
+        if activity in text_lower
+    )
+
+    # -------------------------
+    # Strong resume identity
+    # -------------------------
+
+    explicit_resume_identity = any(
+        phrase in text_lower
+        for phrase in [
+            "resume",
+            "curriculum vitae",
+            "cv"
+        ]
+    )
+
+    # -------------------------
+    # Final validation rules
+    # -------------------------
+
+    # Very strong case:
+    # several resume categories + contact.
+    if categories_found >= 4 and contact_found:
+        return True
+
+    # Strong case:
+    # categories + technical skills + contact.
+    if (
+        categories_found >= 3
+        and skill_count >= 2
+        and contact_found
+    ):
+        return True
+
+    # Technical/student resume without contact:
+    # several categories + multiple skills + activity.
+    if (
+        categories_found >= 4
+        and skill_count >= 2
+        and activity_count >= 1
+    ):
+        return True
+
+    # Explicit resume/CV with supporting structure.
+    if (
+        explicit_resume_identity
+        and categories_found >= 3
+        and (
+            contact_found
+            or skill_count >= 2
+        )
+    ):
+        return True
+
+    # Non-technical resumes can still be valid.
+    # Require stronger structure for them.
+    if (
+        categories_found >= 5
+        and contact_found
+        and activity_count >= 1
+    ):
+        return True
+
+    return False
 
 
 # =========================
@@ -152,6 +606,10 @@ def find_first(text, patterns):
     return None
 
 
+# =========================
+# SECTION DETECTION
+# =========================
+
 def detect_sections(text):
 
     text_lower = text.lower()
@@ -162,13 +620,15 @@ def detect_sections(text):
             "email",
             "phone",
             "linkedin",
-            "github"
+            "github",
+            "portfolio"
         ],
 
         "Summary": [
             "summary",
             "profile",
-            "objective"
+            "objective",
+            "professional summary"
         ],
 
         "Education": [
@@ -185,13 +645,15 @@ def detect_sections(text):
         "Skills": [
             "skills",
             "technical skills",
-            "technologies"
+            "technologies",
+            "programming skills"
         ],
 
         "Experience": [
             "experience",
             "work experience",
-            "employment"
+            "employment",
+            "professional experience"
         ],
 
         "Internship": [
@@ -226,10 +688,15 @@ def detect_sections(text):
             if keyword in text_lower:
 
                 detected.append(section)
+
                 break
 
     return detected
 
+
+# =========================
+# SKILL DETECTION
+# =========================
 
 def detect_skills(text):
 
@@ -283,13 +750,17 @@ def detect_skills(text):
     )
 
 
+# =========================
+# METRICS
+# =========================
+
 def detect_metrics(text):
 
     patterns = [
         r"\b\d+%",
         r"\b\d+\+",
         r"\b\d+\s*(?:users|customers|projects|clients|members)",
-        r"\b\d+(?:,\d{3})\s(?:records|rows|items)",
+        r"\b\d+(?:,\d{3})\s*(?:records|rows|items)",
         r"\b\d+(?:\.\d+)?\s*(?:seconds|ms|hours|days|months|years)"
     ]
 
@@ -310,6 +781,10 @@ def detect_metrics(text):
     )
 
 
+# =========================
+# ACTION VERBS
+# =========================
+
 def detect_action_verbs(text):
 
     action_verbs = [
@@ -318,7 +793,6 @@ def detect_action_verbs(text):
         "built",
         "designed",
         "implemented",
-        "developed",
         "managed",
         "led",
         "analyzed",
@@ -353,7 +827,7 @@ def detect_action_verbs(text):
 
 
 # =========================
-# RULE-BASED RESUME ANALYSIS
+# RULE-BASED ANALYSIS
 # =========================
 
 def analyze_resume_text(text):
@@ -367,10 +841,7 @@ def analyze_resume_text(text):
 
     breakdown = {}
 
-    # -------------------------
     # Sections
-    # -------------------------
-
     section_score = min(
         len(sections) * 5,
         30
@@ -380,11 +851,7 @@ def analyze_resume_text(text):
 
     breakdown["Sections"] = section_score
 
-
-    # -------------------------
     # Skills
-    # -------------------------
-
     skill_score = min(
         len(skills) * 2,
         20
@@ -394,11 +861,7 @@ def analyze_resume_text(text):
 
     breakdown["Skills"] = skill_score
 
-
-    # -------------------------
     # Action verbs
-    # -------------------------
-
     verb_score = min(
         len(action_verbs) * 2,
         15
@@ -408,11 +871,7 @@ def analyze_resume_text(text):
 
     breakdown["Action Verbs"] = verb_score
 
-
-    # -------------------------
     # Metrics
-    # -------------------------
-
     metric_score = min(
         len(metrics) * 3,
         15
@@ -422,11 +881,7 @@ def analyze_resume_text(text):
 
     breakdown["Quantified Results"] = metric_score
 
-
-    # -------------------------
-    # Contact information
-    # -------------------------
-
+    # Contact
     email_found = bool(
         re.search(
             r"[\w\.-]+@[\w\.-]+\.\w+",
@@ -441,8 +896,13 @@ def analyze_resume_text(text):
         )
     )
 
-    linkedin_found = "linkedin" in text.lower()
-    github_found = "github" in text.lower()
+    linkedin_found = (
+        "linkedin" in text.lower()
+    )
+
+    github_found = (
+        "github" in text.lower()
+    )
 
     contact_score = 0
 
@@ -462,20 +922,14 @@ def analyze_resume_text(text):
 
     breakdown["Contact Information"] = contact_score
 
-
-    # -------------------------
-    # Final score
-    # -------------------------
-
     score = min(
         score,
         100
     )
 
-
-    # -------------------------
-    # Strengths
-    # -------------------------
+    # =========================
+    # STRENGTHS
+    # =========================
 
     strengths = []
 
@@ -529,53 +983,71 @@ def analyze_resume_text(text):
             "Resume contains identifiable resume content."
         )
 
-
-    # -------------------------
-    # Suggestions
-    # -------------------------
+    # =========================
+    # SUGGESTIONS
+    # =========================
 
     suggestions = []
 
     if "Summary" not in sections:
+
         suggestions.append(
             "Consider adding a concise professional summary tailored to your target role."
         )
 
     if "Projects" not in sections:
+
         suggestions.append(
             "Add relevant projects and clearly explain your contribution and technologies used."
         )
 
-    if "Experience" not in sections and "Internship" not in sections:
+    if (
+        "Experience" not in sections
+        and "Internship" not in sections
+    ):
+
         suggestions.append(
-            "If you have relevant experience or internships, include them with specific responsibilities and results."
+            "If you have relevant experience or internships, include them with specific responsibilities and genuine results."
+        )
+
+    if "Certifications" not in sections:
+
+        suggestions.append(
+            "If you have relevant certifications, consider adding a Certifications section. Choose certifications related to your target role."
         )
 
     if len(metrics) == 0:
+
         suggestions.append(
-            "Your bullets contain few measurable results. Add genuine numbers or outcomes where available."
+            "Add genuine numbers or measurable outcomes to project or experience bullets where available."
         )
 
     if len(action_verbs) < 3:
+
         suggestions.append(
             "Use stronger action verbs such as developed, implemented, analyzed, or optimized where truthful."
         )
 
     if len(skills) < 3:
+
         suggestions.append(
             "Make relevant technical skills easier to identify for recruiters and ATS systems."
         )
 
     if not linkedin_found:
+
         suggestions.append(
             "Consider adding your LinkedIn profile if you have one."
         )
 
-    if not github_found and len(skills) > 0:
+    if (
+        not github_found
+        and len(skills) > 0
+    ):
+
         suggestions.append(
             "If you have relevant code projects, consider adding your GitHub profile."
         )
-
 
     return {
 
@@ -605,6 +1077,17 @@ def analyze_resume_text(text):
 
 def generate_ai_feedback(resume_text):
 
+    if gemini_client is None:
+
+        return (
+            "AI feedback is unavailable because the Gemini API key "
+            "is not configured."
+        )
+
+    # Keep AI prompt reasonably small for faster response.
+    # Rule-based analysis still uses the complete text.
+    resume_for_ai = resume_text[:12000]
+
     prompt = f"""
 You are an expert resume and career advisor.
 
@@ -615,11 +1098,11 @@ IMPORTANT RULES:
 - Give honest and specific feedback.
 - Use ONLY information present in the resume.
 - Never invent skills, achievements, experience, numbers, technologies, employers, or results.
-- Do not recommend fake achievements.
-- If metrics are missing, say the candidate should add genuine metrics if they have them.
+- Never recommend fake achievements.
+- If a certification, skill, project, or extra section could help, explain that it should be added ONLY if it is genuinely relevant and the candidate actually has it or can legitimately earn it.
+- Do not claim that a candidate has a certification or skill unless it appears in the resume.
 - Identify actual weaknesses from the provided resume.
-- Avoid generic advice when the resume gives enough information for specific advice.
-- Keep the advice professional and useful for a student or job applicant.
+- Keep the advice useful for a student or job applicant.
 
 Give your response in this structure:
 
@@ -633,10 +1116,12 @@ STRENGTHS
 
 SPECIFIC WRITING IMPROVEMENTS
 
+CERTIFICATION / EXTRA SKILL SUGGESTIONS
+
 FINAL CAREER ADVICE
 
 RESUME:
-{resume_text}
+{resume_for_ai}
 """
 
     try:
@@ -649,7 +1134,9 @@ RESUME:
         if response.text:
             return response.text
 
-        return "AI feedback was not generated."
+        return (
+            "AI feedback was not generated."
+        )
 
     except Exception as e:
 
@@ -690,25 +1177,37 @@ async def analyze_resume(
         file.filename or ""
     ).lower()
 
-
     # -------------------------
-    # File type check
+    # Supported file types
     # -------------------------
 
-    if not (
-        filename.endswith(".pdf")
-        or filename.endswith(".docx")
+    supported_extensions = (
+        ".pdf",
+        ".docx",
+        ".jpg",
+        ".jpeg",
+        ".png"
+    )
+
+    if not filename.endswith(
+        supported_extensions
     ):
 
         return {
             "success": False,
             "message":
-            "Please upload a PDF or DOCX resume."
+            "Please upload a PDF, DOCX, JPG, JPEG, or PNG resume."
         }
-
 
     file_bytes = await file.read()
 
+    if not file_bytes:
+
+        return {
+            "success": False,
+            "message":
+            "The uploaded file is empty."
+        }
 
     # -------------------------
     # Extract text
@@ -722,9 +1221,15 @@ async def analyze_resume(
                 file_bytes
             )
 
-        else:
+        elif filename.endswith(".docx"):
 
             text = extract_docx_text(
+                file_bytes
+            )
+
+        else:
+
+            text = extract_image_text(
                 file_bytes
             )
 
@@ -738,22 +1243,30 @@ async def analyze_resume(
         return {
             "success": False,
             "message":
-            "Could not read this document."
+            "Could not read this document. Please upload a clear, readable resume."
         }
 
+    text = text.strip()
 
     # -------------------------
-    # Empty document check
+    # Empty / unreadable check
     # -------------------------
 
-    if len(text.strip()) < 50:
+    if len(text) < 50:
 
         return {
             "success": False,
             "message":
-            "Could not read enough text from this document."
+            "Could not read enough text from this document. Please upload a clearer resume."
         }
 
+    if not text_quality_is_reasonable(text):
+
+        return {
+            "success": False,
+            "message":
+            "The document text could not be read clearly enough. Please upload a clearer resume."
+        }
 
     # -------------------------
     # Resume validation
@@ -767,7 +1280,6 @@ async def analyze_resume(
             "This document does not appear to be a resume. Please upload a valid resume."
         }
 
-
     # -------------------------
     # Rule-based analysis
     # -------------------------
@@ -776,15 +1288,13 @@ async def analyze_resume(
         text
     )
 
-
     # -------------------------
-    # Gemini analysis
+    # Gemini AI Advisor
     # -------------------------
 
     ai_feedback = generate_ai_feedback(
         text
     )
-
 
     # -------------------------
     # Final response
@@ -827,6 +1337,6 @@ async def analyze_resume(
         "ai_feedback":
         ai_feedback,
 
-         "text_preview":
+        "text_preview":
         text[:500]
     }
