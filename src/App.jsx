@@ -15,8 +15,24 @@ function App() {
 
     const name = selectedFile.name.toLowerCase();
 
-    if (!name.endsWith(".pdf") && !name.endsWith(".docx")) {
-      alert("Please upload a PDF or DOCX resume.");
+    const allowedFormats = [
+      ".pdf",
+      ".docx",
+      ".jpg",
+      ".jpeg",
+      ".png"
+    ];
+
+    const isAllowed = allowedFormats.some((format) =>
+      name.endsWith(format)
+    );
+
+    if (!isAllowed) {
+      alert(
+        "Please upload a valid resume in PDF, DOCX, JPG, JPEG or PNG format."
+      );
+
+      event.target.value = "";
       return;
     }
 
@@ -52,7 +68,7 @@ function App() {
       setResult({
         success: false,
         message:
-          "Backend se connection nahi ho raha. FastAPI server check karo."
+          "Backend se connection nahi ho raha. Please try again."
       });
     } finally {
       setLoading(false);
@@ -90,6 +106,28 @@ function App() {
     }
 
     return "score-low";
+  }
+
+  function getFileType(filename) {
+    const name = filename.toLowerCase();
+
+    if (name.endsWith(".pdf")) {
+      return "PDF";
+    }
+
+    if (name.endsWith(".docx")) {
+      return "DOCX";
+    }
+
+    if (name.endsWith(".jpg") || name.endsWith(".jpeg")) {
+      return "JPG";
+    }
+
+    if (name.endsWith(".png")) {
+      return "PNG";
+    }
+
+    return "FILE";
   }
 
   function showAIAdvice(advice) {
@@ -182,7 +220,17 @@ function App() {
             </h2>
 
             <p>
-              Upload a PDF or DOCX resume to begin the analysis.
+              Upload PDF, DOCX, JPG, JPEG or PNG resume.
+            </p>
+
+            <p
+              style={{
+                fontSize: "13px",
+                opacity: 0.7,
+                marginTop: "-5px"
+              }}
+            >
+              Scanned and image-based resumes are also supported.
             </p>
 
 
@@ -192,7 +240,7 @@ function App() {
 
               <input
                 type="file"
-                accept=".pdf,.docx"
+                accept=".pdf,.docx,.jpg,.jpeg,.png"
                 onChange={handleFile}
               />
 
@@ -204,9 +252,7 @@ function App() {
               <div className="selected-file">
 
                 <div className="file-type">
-                  {file.name.toLowerCase().endsWith(".pdf")
-                    ? "PDF"
-                    : "DOCX"}
+                  {getFileType(file.name)}
                 </div>
 
                 <div className="file-details">
