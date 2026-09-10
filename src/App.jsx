@@ -1,829 +1,1914 @@
 import { useState } from "react";
 import "./App.css";
 
-function App() {
-  const [file, setFile] = useState(null);
-  const [loading, setLoading] = useState(false);
-  const [result, setResult] = useState(null);
+const API_URL =
+  window.location.hostname === "localhost"
+    ? "http://127.0.0.1:8000"
+    : "https://resume-ai-analyer.onrender.com";
 
-  function handleFile(event) {
-    const selectedFile = event.target.files[0];
+const SECTION_LIST = [
+  ["contact", "Contact"],
+  ["summary", "Summary"],
+  ["education", "Education"],
+  ["skills", "Skills"],
+  ["experience", "Experience"],
+  ["internship", "Internship"],
+  ["projects", "Projects"],
+  ["certifications", "Certifications"],
+  ["achievements", "Achievements"],
+];
 
-    if (!selectedFile) {
-      return;
-    }
-
-    const name = selectedFile.name.toLowerCase();
-
-    const allowedFormats = [
-      ".pdf",
-      ".docx",
-      ".jpg",
-      ".jpeg",
-      ".png"
-    ];
-
-    const isAllowed = allowedFormats.some((format) =>
-      name.endsWith(format)
-    );
-
-    if (!isAllowed) {
-      alert(
-        "Please upload a valid resume in PDF, DOCX, JPG, JPEG or PNG format."
-      );
-
-      event.target.value = "";
-      return;
-    }
-
-    setFile(selectedFile);
-    setResult(null);
+function getScoreInfo(score) {
+  if (score >= 90) {
+    return {
+      className: "good",
+      label: "Excellent Resume",
+    };
   }
 
-  async function analyzeResume() {
-    if (!file) {
-      alert("Please upload your resume first.");
-      return;
-    }
-
-    setLoading(true);
-    setResult(null);
-
-    const formData = new FormData();
-    formData.append("file", file);
-
-    try {
-      const response = await fetch(
-        "https://resume-ai-analyer.onrender.com/analyze",
-        {
-          method: "POST",
-          body: formData
-        }
-      );
-
-      const data = await response.json();
-
-      setResult(data);
-    } catch (error) {
-      setResult({
-        success: false,
-        message:
-          "Backend se connection nahi ho raha. Please try again."
-      });
-    } finally {
-      setLoading(false);
-    }
+  if (score >= 80) {
+    return {
+      className: "good",
+      label: "Strong Resume",
+    };
   }
 
-  function resetApp() {
-    setFile(null);
-    setResult(null);
+  if (score >= 70) {
+    return {
+      className: "average",
+      label: "Good Resume",
+    };
   }
 
-  function scoreText(score) {
-    if (score >= 80) {
-      return "Strong Resume";
-    }
-
-    if (score >= 60) {
-      return "Good, but can improve";
-    }
-
-    if (score >= 40) {
-      return "Needs Improvement";
-    }
-
-    return "Major Improvements Needed";
+  if (score >= 60) {
+    return {
+      className: "average",
+      label: "Needs Improvement",
+    };
   }
 
-  function scoreClass(score) {
-    if (score >= 80) {
-      return "score-good";
-    }
+  return {
+    className: "poor",
+    label: "Weak Resume",
+  };
+}
 
-    if (score >= 60) {
-      return "score-average";
-    }
+function canonicalSections(sections) {
+  if (!Array.isArray(sections)) return [];
 
-    return "score-low";
-  }
+  return sections.map((item) =>
+    String(item).toLowerCase()
+  );
+}
 
-  function getFileType(filename) {
-    const name = filename.toLowerCase();
+function isSectionHeading(line) {
+  const value = line
+    .replace(/[^a-zA-Z ]/g, "")
+    .trim()
+    .toLowerCase();
 
-    if (name.endsWith(".pdf")) {
-      return "PDF";
-    }
+  const headings = [
+    "professional summary",
+    "summary",
+    "profile",
+    "objective",
+    "skills",
+    "technical skills",
+    "experience",
+    "work experience",
+    "professional experience",
+    "internship",
+    "internships",
+    "projects",
+    "education",
+    "certifications",
+    "certification",
+    "achievements",
+    "awards",
+    "honors",
+  ];
 
-    if (name.endsWith(".docx")) {
-      return "DOCX";
-    }
+  return headings.includes(value);
+}
 
-    if (name.endsWith(".jpg") || name.endsWith(".jpeg")) {
-      return "JPG";
-    }
+function isBullet(line) {
+  return /^(?:[•●▪◦‣*-]|\d+[.)])\s+/.test(
+    line.trim()
+  );
+}
 
-    if (name.endsWith(".png")) {
-      return "PNG";
-    }
+function renderEnhancedPreview(text) {
+  if (!text) return null;
 
-    return "FILE";
-  }
+  const lines = text.split(/\r?\n/);
+  let meaningfulIndex = 0;
 
-  function showAIAdvice(advice) {
-    if (!advice) {
+  return lines.map((rawLine, index) => {
+    const line = rawLine.trim();
+
+    if (!line) {
       return (
-        <p className="muted">
-          AI advice is currently unavailable.
-        </p>
+        <div
+          className="resume-preview-space"
+          key={index}
+        />
       );
     }
 
-    if (typeof advice === "string") {
+    const currentMeaningfulIndex =
+      meaningfulIndex;
+
+    meaningfulIndex += 1;
+
+    if (currentMeaningfulIndex === 0) {
       return (
-        <div className="ai-text">
-          {advice}
+        <div
+          className="resume-preview-name"
+          key={index}
+        >
+          {line}
+        </div>
+      );
+    }
+
+    if (
+      currentMeaningfulIndex === 1 &&
+      (line.includes("@") ||
+        line.includes("linkedin") ||
+        line.includes("github") ||
+        /\d{7,}/.test(line))
+    ) {
+      return (
+        <div
+          className="resume-preview-contact"
+          key={index}
+        >
+          {line}
+        </div>
+      );
+    }
+
+    if (isSectionHeading(line)) {
+      return (
+        <div
+          className="resume-preview-section"
+          key={index}
+        >
+          {line.toUpperCase()}
+        </div>
+      );
+    }
+
+    if (isBullet(line)) {
+      return (
+        <div
+          className="resume-preview-bullet"
+          key={index}
+        >
+          <span>•</span>
+
+          <span>
+            {line.replace(
+              /^(?:[•●▪◦‣*-]|\d+[.)])\s+/,
+              ""
+            )}
+          </span>
         </div>
       );
     }
 
     return (
-      <pre className="ai-text">
-        {JSON.stringify(advice, null, 2)}
-      </pre>
+      <div
+        className="resume-preview-line"
+        key={index}
+      >
+        {line}
+      </div>
+    );
+  });
+}
+
+function App() {
+  const [file, setFile] = useState(null);
+
+  const [photo, setPhoto] = useState(null);
+  const [photoPreview, setPhotoPreview] =
+    useState("");
+
+  const [result, setResult] = useState(null);
+
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState("");
+
+  const [aiAdvice, setAiAdvice] = useState(null);
+  const [aiStatus, setAiStatus] = useState("");
+
+  const [chatMessages, setChatMessages] =
+    useState([]);
+  const [chatInput, setChatInput] =
+    useState("");
+  const [chatLoading, setChatLoading] =
+    useState(false);
+
+  const [enhancing, setEnhancing] =
+    useState(false);
+
+  const [checkingPhoto, setCheckingPhoto] =
+    useState(false);
+
+  const [
+    showEnhancePhotoOptions,
+    setShowEnhancePhotoOptions,
+  ] = useState(false);
+
+  const [
+    originalPhotoDetected,
+    setOriginalPhotoDetected,
+  ] = useState(null);
+
+  const [enhancedResume, setEnhancedResume] =
+    useState("");
+
+  const [enhancedPdf, setEnhancedPdf] =
+    useState("");
+
+  const [
+    enhancedFilename,
+    setEnhancedFilename,
+  ] = useState("");
+
+  const [enhanceError, setEnhanceError] =
+    useState("");
+
+  const [showDetails, setShowDetails] =
+    useState(false);
+
+  const resumeJobId =
+    result?.resume_job_id ||
+    result?.job_id;
+
+  const score = Number(
+    result?.score || 0
+  );
+
+  const scoreInfo =
+    getScoreInfo(score);
+
+  const detectedSections =
+    canonicalSections(
+      result?.detected_sections ||
+        result?.sections ||
+        []
+    );
+
+  const skills = Array.isArray(
+    result?.skills
+  )
+    ? result.skills
+    : Array.isArray(
+        result?.skills_detected
+      )
+      ? result.skills_detected
+      : [];
+
+  const strengths = Array.isArray(
+    result?.strengths
+  )
+    ? result.strengths
+    : [];
+
+  const suggestions = Array.isArray(
+    result?.suggestions
+  )
+    ? result.suggestions
+    : [];
+
+  const actionPlan =
+    Array.isArray(
+      result?.action_plan
+    ) &&
+    result.action_plan.length > 0
+      ? result.action_plan
+      : suggestions;
+
+  const breakdown =
+    result?.breakdown || {};
+
+  function handleFileChange(event) {
+    const selectedFile =
+      event.target.files?.[0];
+
+    if (!selectedFile) return;
+
+    setFile(selectedFile);
+
+    setPhoto(null);
+    setPhotoPreview("");
+
+    setResult(null);
+    setError("");
+
+    setAiAdvice(null);
+    setAiStatus("");
+
+    setEnhancedResume("");
+    setEnhancedPdf("");
+    setEnhancedFilename("");
+    setEnhanceError("");
+
+    setShowEnhancePhotoOptions(false);
+    setCheckingPhoto(false);
+    setOriginalPhotoDetected(null);
+
+    setChatMessages([]);
+    setChatInput("");
+  }
+
+  function handlePhotoChange(event) {
+    const selectedPhoto =
+      event.target.files?.[0];
+
+    if (!selectedPhoto) return;
+
+    if (
+      ![
+        "image/jpeg",
+        "image/png",
+      ].includes(selectedPhoto.type)
+    ) {
+      setEnhanceError(
+        "Please select a JPG or PNG photo."
+      );
+      return;
+    }
+
+    setPhoto(selectedPhoto);
+    setEnhanceError("");
+
+    const url =
+      URL.createObjectURL(
+        selectedPhoto
+      );
+
+    setPhotoPreview(url);
+  }
+
+  async function fetchAIAdvice(jobId) {
+    setAiStatus("processing");
+
+    for (let i = 0; i < 80; i += 1) {
+      try {
+        const response =
+          await fetch(
+            `${API_URL}/ai-feedback/${jobId}`
+          );
+
+        const data =
+          await response.json();
+
+        if (
+          data.status ===
+          "completed"
+        ) {
+          setAiAdvice(
+            data.ai_feedback
+          );
+
+          setAiStatus(
+            "completed"
+          );
+
+          return;
+        }
+
+        if (
+          data.status === "failed"
+        ) {
+          setAiStatus("failed");
+          return;
+        }
+      } catch {
+        // Continue polling.
+      }
+
+      await new Promise(
+        (resolve) =>
+          setTimeout(
+            resolve,
+            1500
+          )
+      );
+    }
+
+    setAiStatus("failed");
+  }
+
+  async function analyzeResume() {
+    if (!file) {
+      setError(
+        "Please select a resume first."
+      );
+      return;
+    }
+
+    setLoading(true);
+    setError("");
+
+    setResult(null);
+    setAiAdvice(null);
+    setAiStatus("");
+
+    setEnhancedResume("");
+    setEnhancedPdf("");
+    setEnhancedFilename("");
+    setEnhanceError("");
+
+    setShowEnhancePhotoOptions(
+      false
+    );
+
+    setCheckingPhoto(false);
+    setOriginalPhotoDetected(null);
+
+    setPhoto(null);
+    setPhotoPreview("");
+
+    setChatMessages([]);
+    setChatInput("");
+
+    try {
+      const formData =
+        new FormData();
+
+      formData.append(
+        "file",
+        file
+      );
+
+      const response =
+        await fetch(
+          `${API_URL}/analyze`,
+          {
+            method: "POST",
+            body: formData,
+          }
+        );
+
+      const data =
+        await response.json();
+
+      if (
+        !response.ok ||
+        !data.success
+      ) {
+        throw new Error(
+          data.message ||
+            "Resume analysis failed."
+        );
+      }
+
+      setResult(data);
+
+      const jobId =
+        data.resume_job_id ||
+        data.ai_feedback_job_id ||
+        data.job_id;
+
+      if (jobId) {
+        fetchAIAdvice(jobId);
+      }
+    } catch (err) {
+      setError(
+        err.message ||
+          "Could not analyze the resume."
+      );
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  /*
+   * This function checks whether the ORIGINAL
+   * uploaded PDF/DOCX contains a profile photo.
+   *
+   * If the backend says a photo exists:
+   * - Do not ask user for another photo.
+   * - Directly create the enhanced resume.
+   *
+   * If no photo exists:
+   * - Show Add Photo / Skip options.
+   */
+  async function handleEnhanceClick() {
+    if (!resumeJobId) {
+      setEnhanceError(
+        "Please analyze a resume first."
+      );
+      return;
+    }
+
+    if (!file) {
+      setEnhanceError(
+        "Original resume file is not available."
+      );
+      return;
+    }
+
+    setCheckingPhoto(true);
+    setEnhanceError("");
+
+    setShowEnhancePhotoOptions(
+      false
+    );
+
+    try {
+      const formData =
+        new FormData();
+
+      formData.append(
+        "job_id",
+        resumeJobId
+      );
+
+      formData.append(
+        "resume_file",
+        file
+      );
+
+      const response =
+        await fetch(
+          `${API_URL}/enhance-photo-status`,
+          {
+            method: "POST",
+            body: formData,
+          }
+        );
+
+      const data =
+        await response.json();
+
+      if (
+        !response.ok ||
+        data.success === false
+      ) {
+        throw new Error(
+          data.message ||
+            "Could not check the original resume photo."
+        );
+      }
+
+      const detected =
+        Boolean(
+          data.photo_detected
+        );
+
+      setOriginalPhotoDetected(
+        detected
+      );
+
+      if (detected) {
+        /*
+         * Original photo exists.
+         * Backend will preserve it.
+         */
+        await createEnhancedResume(
+          null
+        );
+      } else {
+        /*
+         * No original photo.
+         * Now ask user whether they want
+         * to add one.
+         */
+        setShowEnhancePhotoOptions(
+          true
+        );
+      }
+    } catch (err) {
+      setEnhanceError(
+        err.message ||
+          "Could not check the resume photo."
+      );
+    } finally {
+      setCheckingPhoto(false);
+    }
+  }
+
+  /*
+   * Actually creates the enhanced resume.
+   *
+   * photoToSend can be:
+   * - null = no user photo
+   * - File = user-selected photo
+   */
+  async function createEnhancedResume(
+    photoToSend = null
+  ) {
+    if (!resumeJobId) {
+      setEnhanceError(
+        "Please analyze a resume first."
+      );
+      return;
+    }
+
+    if (!file) {
+      setEnhanceError(
+        "Original resume file is not available."
+      );
+      return;
+    }
+
+    setEnhancing(true);
+    setEnhanceError("");
+
+    setEnhancedResume("");
+    setEnhancedPdf("");
+    setEnhancedFilename("");
+
+    try {
+      const formData =
+        new FormData();
+
+      formData.append(
+        "job_id",
+        resumeJobId
+      );
+
+      /*
+       * Important:
+       * Send the ORIGINAL resume file.
+       * Backend can extract the original
+       * embedded profile photo from it.
+       */
+      formData.append(
+        "resume_file",
+        file
+      );
+
+      /*
+       * Only send a user photo when
+       * user explicitly selected one.
+       */
+      if (photoToSend) {
+        formData.append(
+          "photo",
+          photoToSend
+        );
+      }
+
+      const response =
+        await fetch(
+          `${API_URL}/enhance`,
+          {
+            method: "POST",
+            body: formData,
+          }
+        );
+
+      const data =
+        await response.json();
+
+      if (
+        !response.ok ||
+        !data.success
+      ) {
+        throw new Error(
+          data.message ||
+            "Resume enhancement failed."
+        );
+      }
+
+      setEnhancedResume(
+        data.enhanced_resume || ""
+      );
+
+      setEnhancedPdf(
+        data.pdf_base64 || ""
+      );
+
+      setEnhancedFilename(
+        data.filename ||
+          "ResumeAI-Professional-Resume.pdf"
+      );
+
+      /*
+       * Enhancement is complete,
+       * so hide photo-selection UI.
+       */
+      setShowEnhancePhotoOptions(
+        false
+      );
+    } catch (err) {
+      setEnhanceError(
+        err.message ||
+          "Could not create the professional resume."
+      );
+    } finally {
+      setEnhancing(false);
+    }
+  }
+
+  async function skipPhotoAndEnhance() {
+    setPhoto(null);
+    setPhotoPreview("");
+    setEnhanceError("");
+
+    await createEnhancedResume(
+      null
     );
   }
 
+  async function addPhotoAndEnhance() {
+    if (!photo) {
+      setEnhanceError(
+        "Please choose a JPG or PNG photo first."
+      );
+      return;
+    }
+
+    await createEnhancedResume(
+      photo
+    );
+  }
+
+  function downloadEnhancedPDF() {
+    if (!enhancedPdf) {
+      setEnhanceError(
+        "The PDF is not ready yet."
+      );
+      return;
+    }
+
+    try {
+      const binary =
+        atob(enhancedPdf);
+
+      const bytes =
+        new Uint8Array(
+          binary.length
+        );
+
+      for (
+        let i = 0;
+        i < binary.length;
+        i += 1
+      ) {
+        bytes[i] =
+          binary.charCodeAt(i);
+      }
+
+      const blob =
+        new Blob(
+          [bytes],
+          {
+            type: "application/pdf",
+          }
+        );
+
+      const url =
+        URL.createObjectURL(
+          blob
+        );
+
+      const link =
+        document.createElement(
+          "a"
+        );
+
+      link.href = url;
+
+      link.download =
+        enhancedFilename ||
+        "ResumeAI-Professional-Resume.pdf";
+
+      document.body.appendChild(
+        link
+      );
+
+      link.click();
+
+      link.remove();
+
+      URL.revokeObjectURL(url);
+    } catch {
+      setEnhanceError(
+        "Could not download the PDF."
+      );
+    }
+  }
+
+  async function sendChatMessage() {
+    const message =
+      chatInput.trim();
+
+    if (
+      !message ||
+      !resumeJobId
+    ) {
+      return;
+    }
+
+    setChatInput("");
+
+    setChatMessages(
+      (previous) => [
+        ...previous,
+        {
+          role: "user",
+          text: message,
+        },
+      ]
+    );
+
+    setChatLoading(true);
+
+    try {
+      const response =
+        await fetch(
+          `${API_URL}/chat`,
+          {
+            method: "POST",
+            headers: {
+              "Content-Type":
+                "application/json",
+            },
+            body: JSON.stringify({
+              job_id:
+                resumeJobId,
+              message,
+            }),
+          }
+        );
+
+      const data =
+        await response.json();
+
+      if (!data.success) {
+        throw new Error(
+          data.message ||
+            "Chat request failed."
+        );
+      }
+
+      const chatJobId =
+        data.chat_job_id;
+
+      if (!chatJobId) {
+        throw new Error(
+          "AI chat job was not created."
+        );
+      }
+
+      for (
+        let i = 0;
+        i < 80;
+        i += 1
+      ) {
+        const pollResponse =
+          await fetch(
+            `${API_URL}/chat/${chatJobId}`
+          );
+
+        const pollData =
+          await pollResponse.json();
+
+        if (
+          pollData.status ===
+          "completed"
+        ) {
+          setChatMessages(
+            (previous) => [
+              ...previous,
+              {
+                role: "assistant",
+                text:
+                  pollData.chat_answer ||
+                  pollData.answer ||
+                  "",
+              },
+            ]
+          );
+
+          break;
+        }
+
+        if (
+          pollData.status ===
+          "failed"
+        ) {
+          throw new Error(
+            pollData.message ||
+              "AI chat failed."
+          );
+        }
+
+        await new Promise(
+          (resolve) =>
+            setTimeout(
+              resolve,
+              1200
+            )
+        );
+      }
+    } catch (err) {
+      setChatMessages(
+        (previous) => [
+          ...previous,
+          {
+            role: "assistant",
+            text:
+              err.message ||
+              "Sorry, AI chat failed.",
+          },
+        ]
+      );
+    } finally {
+      setChatLoading(false);
+    }
+  }
+
+  function handleChatKeyDown(
+    event
+  ) {
+    if (
+      event.key === "Enter" &&
+      !event.shiftKey
+    ) {
+      event.preventDefault();
+      sendChatMessage();
+    }
+  }
+
+  function resetApp() {
+    setFile(null);
+
+    setPhoto(null);
+    setPhotoPreview("");
+
+    setResult(null);
+    setError("");
+
+    setAiAdvice(null);
+    setAiStatus("");
+
+    setChatMessages([]);
+    setChatInput("");
+
+    setEnhancedResume("");
+    setEnhancedPdf("");
+    setEnhancedFilename("");
+    setEnhanceError("");
+
+    setShowEnhancePhotoOptions(
+      false
+    );
+
+    setCheckingPhoto(false);
+    setOriginalPhotoDetected(null);
+
+    setShowDetails(false);
+  }
+
   return (
-    <div className="app">
-
+    <div className="app-shell">
       <header className="topbar">
-
         <div className="brand">
-
           <div className="brand-logo">
             R
           </div>
 
           <div>
             <div className="brand-name">
-              Resume<span>AI</span>
+              ResumeAI
             </div>
 
             <div className="brand-subtitle">
-              INTELLIGENT RESUME ANALYZER
+              AI Resume Analyzer
             </div>
           </div>
-
         </div>
 
-        <div className="engine-status">
-          <span className="status-dot"></span>
-          AI ANALYSIS ENGINE
-        </div>
-
+        {result && (
+          <button
+            className="reset-button"
+            onClick={resetApp}
+          >
+            New Resume
+          </button>
+        )}
       </header>
 
-
       {!result && (
-
-        <main className="home-page">
-
-          <section className="hero">
-
-            <div className="eyebrow">
-              AI-POWERED CAREER INTELLIGENCE
+        <main className="hero-section">
+          <div className="hero-content">
+            <div className="hero-badge">
+              AI-POWERED RESUME ANALYZER
             </div>
 
             <h1>
-              Make your resume
+              Make Your Resume
               <br />
-              <span>impossible to ignore.</span>
+              <span>Job Ready.</span>
             </h1>
 
-            <p className="hero-description">
-              Get an honest resume score, ATS insights,
-              skill detection and personalized AI career advice.
+            <p>
+              Upload your resume and get an
+              honest AI-powered analysis,
+              actionable improvements and
+              career guidance.
             </p>
+          </div>
 
-          </section>
-
-
-          <section className="upload-card">
-
+          <div className="upload-card">
             <div className="upload-icon">
               ↑
             </div>
 
             <h2>
-              Upload your Resume
+              Upload Your Resume
             </h2>
 
             <p>
-              Upload PDF, DOCX, JPG, JPEG or PNG resume.
+              PDF, DOCX, JPG or PNG
             </p>
 
-            <p
-              style={{
-                fontSize: "13px",
-                opacity: 0.7,
-                marginTop: "-5px"
-              }}
-            >
-              Scanned and image-based resumes are also supported.
-            </p>
-
-
-            <label className="choose-button">
-
+            <label className="upload-button">
               Choose Resume
 
               <input
                 type="file"
                 accept=".pdf,.docx,.jpg,.jpeg,.png"
-                onChange={handleFile}
+                onChange={
+                  handleFileChange
+                }
+                hidden
               />
-
             </label>
 
-
             {file && (
-
               <div className="selected-file">
-
-                <div className="file-type">
-                  {getFileType(file.name)}
-                </div>
-
-                <div className="file-details">
-
-                  <strong>
-                    {file.name}
-                  </strong>
-
-                  <span>
-                    {(file.size / 1024).toFixed(1)} KB
-                  </span>
-
-                </div>
-
-                <div className="file-ok">
-                  ✓
-                </div>
-
+                <strong>
+                  Selected:
+                </strong>{" "}
+                {file.name}
               </div>
-
             )}
 
+            {/*
+             * IMPORTANT:
+             * No profile photo upload here.
+             *
+             * Photo selection appears only AFTER
+             * the user clicks Enhance Resume.
+             */}
 
             <button
               className="analyze-button"
-              onClick={analyzeResume}
-              disabled={loading}
+              onClick={
+                analyzeResume
+              }
+              disabled={
+                loading || !file
+              }
             >
-
-              {loading ? (
-                <>
-                  <span className="loading-spinner"></span>
-                  Analyzing Resume...
-                </>
-              ) : (
-                <>
-                  Analyze Resume
-                  <span>→</span>
-                </>
-              )}
-
+              {loading
+                ? "Analyzing..."
+                : "Analyze Resume →"}
             </button>
 
-
-            <div className="privacy">
-              Your resume is analyzed from the document you upload.
-            </div>
-
-          </section>
-
+            {error && (
+              <div className="error-message">
+                {error}
+              </div>
+            )}
+          </div>
         </main>
-
       )}
 
+      {result && (
+        <main className="dashboard">
+          <div className="dashboard-header">
+            <div>
+              <div className="hero-badge">
+                ANALYSIS COMPLETE
+              </div>
 
-      {result && !result.success && (
+              <h1>
+                Your Resume Report
+              </h1>
 
-        <main className="error-page">
-
-          <div className="error-card">
-
-            <div className="error-symbol">
-              !
+              <p>
+                Honest analysis based on the
+                content detected in your resume.
+              </p>
             </div>
-
-            <h1>
-              Resume Not Accepted
-            </h1>
-
-            <p>
-              {result.message}
-            </p>
-
-            <button
-              className="analyze-button"
-              onClick={resetApp}
-            >
-              Upload Another Resume
-              <span>→</span>
-            </button>
-
           </div>
 
-        </main>
-
-      )}
-
-
-      {result && result.success && (
-
-        <main className="dashboard">
-
-          <aside className="sidebar">
-
-            <button
-              className="new-analysis-button"
-              onClick={resetApp}
-            >
-              + New Analysis
-            </button>
-
-
-            <div className="score-panel">
-
-              <div className="panel-label">
-                RESUME SCORE
+          <div className="dashboard-grid">
+            <section className="score-card">
+              <div className="card-heading">
+                <span>📊</span>
+                Resume Score
               </div>
 
               <div
-                className={
-                  "score-circle " + scoreClass(result.score)
-                }
+                className={`score-circle ${scoreInfo.className}`}
               >
+                <strong>
+                  {score}
+                </strong>
 
-                <div className="score-number">
-                  {result.score}
-                  <span>/100</span>
+                <span>
+                  / 100
+                </span>
+              </div>
+
+              <h2>
+                {scoreInfo.label}
+              </h2>
+
+              <p>
+                {result.verdict_message ||
+                  "Your score is based on resume content quality, evidence and ATS factors."}
+              </p>
+
+              {result.why_score?.length >
+                0 && (
+                <div className="why-score">
+                  <h3>
+                    Why this score?
+                  </h3>
+
+                  <ul>
+                    {result.why_score.map(
+                      (
+                        item,
+                        index
+                      ) => (
+                        <li
+                          key={index}
+                        >
+                          {item}
+                        </li>
+                      )
+                    )}
+                  </ul>
                 </div>
+              )}
+            </section>
 
+            <section className="overview-card">
+              <div className="card-heading">
+                <span>📋</span>
+                Resume Overview
               </div>
 
-              <div className="score-status">
-                {scoreText(result.score)}
-              </div>
-
-            </div>
-
-
-            <div className="sidebar-section">
-
-              <div className="sidebar-title">
-                RESUME SECTIONS
-              </div>
-
-              <div className="section-tags">
-
-                {result.detected_sections &&
-                  result.detected_sections.map(
-                    function (section, index) {
-                      return (
-                        <span key={index}>
-                          ✓ {section}
-                        </span>
+              <div className="section-status-list">
+                {SECTION_LIST.map(
+                  ([key, label]) => {
+                    const present =
+                      detectedSections.includes(
+                        key
                       );
-                    }
-                  )}
 
+                    return (
+                      <div
+                        className="section-status"
+                        key={key}
+                      >
+                        <span>
+                          {label}
+                        </span>
+
+                        <span
+                          className={
+                            present
+                              ? "status-present"
+                              : "status-missing"
+                          }
+                        >
+                          {present
+                            ? "✓ Present"
+                            : "✕ Missing"}
+                        </span>
+                      </div>
+                    );
+                  }
+                )}
               </div>
+            </section>
+          </div>
 
+          <section className="report-card">
+            <div className="card-heading">
+              <span>💡</span>
+              Quick Resume Insights
             </div>
 
+            <div className="analysis-grid">
+              <div className="analysis-box">
+                <h3>
+                  📄 Resume Length
+                </h3>
 
-            <div className="sidebar-section">
-
-              <div className="sidebar-title">
-                DETECTED SKILLS
-              </div>
-
-              <div className="skill-count">
-                {result.skills_detected || 0}
-              </div>
-
-            </div>
-
-          </aside>
-
-
-          <section className="report">
-
-            <div className="report-header">
-
-              <div>
-
-                <div className="eyebrow">
-                  RESUME ANALYSIS
-                </div>
-
-                <h1>
-                  Your Resume Report
-                </h1>
-
-                <p>
-                  Detailed feedback based on your actual resume.
+                <p className="insight-value">
+                  {result.word_count ||
+                    0}{" "}
+                  words
                 </p>
 
+                <p className="muted">
+                  Resume content detected by
+                  ResumeAI.
+                </p>
               </div>
 
-
-              {file && (
-
-                <div className="uploaded-file">
-
-                  <strong>
-                    {file.name}
-                  </strong>
-
-                  <span>
-                    Analysis complete
-                  </span>
-
-                </div>
-
-              )}
-
-            </div>
-
-
-            <div className="stats-grid">
-
-              <div className="stat-card">
-
-                <div className="stat-icon">
-                  ◎
-                </div>
-
-                <div>
-                  <small>RESUME SCORE</small>
-                  <strong>{result.score}/100</strong>
-                </div>
-
-              </div>
-
-
-              <div className="stat-card">
-
-                <div className="stat-icon">
-                  ✓
-                </div>
-
-                <div>
-                  <small>SKILLS DETECTED</small>
-                  <strong>{result.skills_detected || 0}</strong>
-                </div>
-
-              </div>
-
-
-              <div className="stat-card">
-
-                <div className="stat-icon">
-                  #
-                </div>
-
-                <div>
-                  <small>METRICS FOUND</small>
-
-                  <strong>
-                    {result.metrics_found
-                      ? result.metrics_found.length
-                      : 0}
-                  </strong>
-
-                </div>
-
-              </div>
-
-
-              <div className="stat-card">
-
-                <div className="stat-icon">
-                  ✦
-                </div>
-
-                <div>
-                  <small>ACTION VERBS</small>
-
-                  <strong>
-                    {result.action_verbs_found
-                      ? result.action_verbs_found.length
-                      : 0}
-                  </strong>
-
-                </div>
-
-              </div>
-
-            </div>
-
-
-            <div className="report-card">
-
-              <div className="card-heading">
-
-                <div>
-
-                  <div className="card-label">
-                    CONTENT
-                  </div>
-
-                  <h2>
-                    Content Analysis
-                  </h2>
-
-                  <p>
-                    Important observations from your resume.
-                  </p>
-
-                </div>
-
-                <div className="issue-count">
-
-                  {result.suggestions
-                    ? result.suggestions.length
-                    : 0}
-
-                  {" "}ISSUES
-
-                </div>
-
-              </div>
-
-
-              <div className="feedback-section">
-
+              <div className="analysis-box">
                 <h3>
-                  ⚠️ High Priority
+                  🛠️ Technical Skills
                 </h3>
 
+                <p className="insight-value">
+                  {skills.length}
+                </p>
 
-                {result.suggestions &&
-                result.suggestions.length > 0 ? (
-
-                  result.suggestions
-                    .slice(0, 3)
-                    .map(function (suggestion, index) {
-
-                      return (
-                        <div
-                          className="feedback-item"
-                          key={index}
-                        >
-
-                          <div className="feedback-icon">
-                            ×
-                          </div>
-
-                          <div>
-                            <strong>
-                              Improvement needed
-                            </strong>
-
-                            <p>
-                              {suggestion}
-                            </p>
-                          </div>
-
-                        </div>
-                      );
-                    })
-
-                ) : (
-
-                  <p className="muted">
-                    No major improvement suggestions were detected.
-                  </p>
-
-                )}
-
+                <p className="muted">
+                  Recognizable technical skills
+                  detected.
+                </p>
               </div>
 
-
-              <div className="feedback-section">
-
-                <h3 className="positive-heading">
-                  ✓ Strengths
+              <div className="analysis-box">
+                <h3>
+                  📌 Resume Sections
                 </h3>
 
+                <p className="insight-value">
+                  {detectedSections.length}
+                </p>
 
-                {result.strengths &&
-                result.strengths.length > 0 ? (
+                <p className="muted">
+                  Resume sections detected
+                  successfully.
+                </p>
+              </div>
 
-                  result.strengths.map(
-                    function (strength, index) {
+              <div className="analysis-box">
+                <h3>
+                  📈 Measurable Evidence
+                </h3>
 
-                      return (
-                        <div
-                          className="feedback-item"
-                          key={index}
-                        >
-
-                          <div className="feedback-icon positive">
-                            ✓
-                          </div>
-
-                          <div>
-                            <p>
-                              {strength}
-                            </p>
-                          </div>
-
-                        </div>
-                      );
-                    }
+                <p className="insight-value">
+                  {Array.isArray(
+                    result.metrics_found
                   )
+                    ? result.metrics_found
+                        .length
+                    : 0}
+                </p>
 
-                ) : (
-
-                  <p className="muted">
-                    No strengths detected.
-                  </p>
-
-                )}
-
+                <p className="muted">
+                  Metrics and measurable evidence
+                  found.
+                </p>
               </div>
-
             </div>
-
-
-            <div className="report-card">
-
-              <div className="card-heading">
-
-                <div>
-
-                  <div className="card-label">
-                    SKILLS
-                  </div>
-
-                  <h2>
-                    Skills Detected
-                  </h2>
-
-                  <p>
-                    Skills found directly in your uploaded resume.
-                  </p>
-
-                </div>
-
-              </div>
-
-
-              <div className="skills-container">
-
-                {result.skills &&
-                result.skills.length > 0 ? (
-
-                  result.skills.map(
-                    function (skill, index) {
-
-                      return (
-                        <span key={index}>
-                          {skill}
-                        </span>
-                      );
-                    }
-                  )
-
-                ) : (
-
-                  <p className="muted">
-                    No specific skills detected.
-                  </p>
-
-                )}
-
-              </div>
-
-            </div>
-
-
-            <div className="ai-advisor">
-
-              <div className="ai-header">
-
-                <div className="ai-logo">
-                  ✦
-                </div>
-
-                <div>
-
-                  <div className="ai-label">
-                    AI CAREER ADVISOR
-                  </div>
-
-                  <h2>
-                    Personalized AI Advice
-                  </h2>
-
-                </div>
-
-              </div>
-
-
-              <div className="ai-body">
-                {showAIAdvice(result.ai_feedback)}
-              </div>
-
-            </div>
-
-
-            <div className="report-card">
-
-              <div className="card-heading">
-
-                <div>
-
-                  <div className="card-label">
-                    ACTION PLAN
-                  </div>
-
-                  <h2>
-                    Recommended Improvements
-                  </h2>
-
-                  <p>
-                    Changes you can make to improve the resume.
-                  </p>
-
-                </div>
-
-              </div>
-
-
-              <div className="recommendations">
-
-                {result.suggestions &&
-                result.suggestions.length > 0 ? (
-
-                  result.suggestions.map(
-                    function (suggestion, index) {
-
-                      return (
-                        <div
-                          className="recommendation"
-                          key={index}
-                        >
-
-                          <div className="recommendation-number">
-                            {index + 1}
-                          </div>
-
-                          <p>
-                            {suggestion}
-                          </p>
-
-                        </div>
-                      );
-                    }
-                  )
-
-                ) : (
-
-                  <p className="muted">
-                    No additional recommendations.
-                  </p>
-
-                )}
-
-              </div>
-
-            </div>
-
-
-            <footer className="report-footer">
-
-              <span>
-                ResumeAI • Intelligent Resume Analysis
-              </span>
-
-              <span>
-                Generated from your uploaded resume
-              </span>
-
-            </footer>
-
           </section>
 
+          <section className="report-card">
+            <div className="card-heading">
+              <span>📈</span>
+              Score Breakdown
+            </div>
+
+            <div className="breakdown-grid">
+              {Object.entries(
+                breakdown
+              ).map(
+                ([key, value]) => (
+                  <div
+                    className="breakdown-item"
+                    key={key}
+                  >
+                    <div>
+                      {key
+                        .replace(
+                          /_/g,
+                          " "
+                        )
+                        .replace(
+                          /\b\w/g,
+                          (char) =>
+                            char.toUpperCase()
+                        )}
+                    </div>
+
+                    <strong>
+                      {value}
+                    </strong>
+                  </div>
+                )
+              )}
+            </div>
+          </section>
+
+          <section className="report-card">
+            <div className="card-heading">
+              <span>✨</span>
+              Content Analysis
+            </div>
+
+            <div className="analysis-grid">
+              <div className="analysis-box">
+                <h3>
+                  ✅ Strengths
+                </h3>
+
+                {strengths.length >
+                0 ? (
+                  <ul>
+                    {strengths.map(
+                      (
+                        item,
+                        index
+                      ) => (
+                        <li
+                          key={index}
+                        >
+                          {item}
+                        </li>
+                      )
+                    )}
+                  </ul>
+                ) : (
+                  <p className="muted">
+                    No major strengths were
+                    detected yet.
+                  </p>
+                )}
+              </div>
+
+              <div className="analysis-box">
+                <h3>
+                  ⚠️ Improvements
+                </h3>
+
+                {suggestions.length >
+                0 ? (
+                  <ul>
+                    {suggestions.map(
+                      (
+                        item,
+                        index
+                      ) => (
+                        <li
+                          key={index}
+                        >
+                          {item}
+                        </li>
+                      )
+                    )}
+                  </ul>
+                ) : (
+                  <p className="muted">
+                    No major improvements
+                    detected.
+                  </p>
+                )}
+              </div>
+            </div>
+          </section>
+
+          <section className="report-card">
+            <div className="card-heading">
+              <span>🛠️</span>
+              Detected Skills
+            </div>
+
+            <div className="skills-list">
+              {skills.length >
+              0 ? (
+                skills.map(
+                  (
+                    skill,
+                    index
+                  ) => (
+                    <span
+                      className="skill-chip"
+                      key={index}
+                    >
+                      {skill}
+                    </span>
+                  )
+                )
+              ) : (
+                <p className="muted">
+                  No recognizable technical
+                  skills were detected.
+                </p>
+              )}
+            </div>
+          </section>
+
+          <section className="report-card ai-advisor">
+            <div className="card-heading">
+              <span>🤖</span>
+              AI Career Advisor
+            </div>
+
+            {aiStatus ===
+              "processing" && (
+              <div className="ai-loading">
+                AI is reviewing your resume...
+              </div>
+            )}
+
+            {aiAdvice &&
+              aiAdvice.success && (
+                <div className="feedback-content">
+                  <div className="feedback-block">
+                    <h3>
+                      Overall Advice
+                    </h3>
+
+                    <p>
+                      {aiAdvice.overall_advice}
+                    </p>
+                  </div>
+
+                  {aiAdvice.high_priority_issues
+                    ?.length >
+                    0 && (
+                    <div className="feedback-block">
+                      <h3>
+                        🔴 High Priority
+                      </h3>
+
+                      <ul>
+                        {aiAdvice.high_priority_issues.map(
+                          (
+                            item,
+                            index
+                          ) => (
+                            <li
+                              key={
+                                index
+                              }
+                            >
+                              {item}
+                            </li>
+                          )
+                        )}
+                      </ul>
+                    </div>
+                  )}
+
+                  {aiAdvice.medium_priority_issues
+                    ?.length >
+                    0 && (
+                    <div className="feedback-block">
+                      <h3>
+                        🟡 Medium Priority
+                      </h3>
+
+                      <ul>
+                        {aiAdvice.medium_priority_issues.map(
+                          (
+                            item,
+                            index
+                          ) => (
+                            <li
+                              key={
+                                index
+                              }
+                            >
+                              {item}
+                            </li>
+                          )
+                        )}
+                      </ul>
+                    </div>
+                  )}
+
+                  {aiAdvice.strengths
+                    ?.length >
+                    0 && (
+                    <div className="feedback-block">
+                      <h3>
+                        🟢 Strengths
+                      </h3>
+
+                      <ul>
+                        {aiAdvice.strengths.map(
+                          (
+                            item,
+                            index
+                          ) => (
+                            <li
+                              key={
+                                index
+                              }
+                            >
+                              {item}
+                            </li>
+                          )
+                        )}
+                      </ul>
+                    </div>
+                  )}
+
+                  {aiAdvice.actionable_suggestions
+                    ?.length >
+                    0 && (
+                    <div className="feedback-block">
+                      <h3>
+                        🎯 Actionable Suggestions
+                      </h3>
+
+                      <ul>
+                        {aiAdvice.actionable_suggestions.map(
+                          (
+                            item,
+                            index
+                          ) => (
+                            <li
+                              key={
+                                index
+                              }
+                            >
+                              {item}
+                            </li>
+                          )
+                        )}
+                      </ul>
+                    </div>
+                  )}
+                </div>
+              )}
+
+            {aiStatus ===
+              "failed" && (
+              <p className="muted">
+                AI advisor could not complete
+                right now. Your rule-based report
+                is still available.
+              </p>
+            )}
+          </section>
+
+          <section className="report-card">
+            <div className="card-heading">
+              <span>💬</span>
+              AI Career Chat
+            </div>
+
+            <p className="muted">
+              Ask anything about this resume in
+              English, Hindi or Hinglish.
+            </p>
+
+            <div className="chat-box">
+              <div className="chat-messages">
+                {chatMessages.length ===
+                  0 && (
+                  <div className="chat-empty">
+                    Ask your first question about
+                    the resume.
+                  </div>
+                )}
+
+                {chatMessages.map(
+                  (
+                    message,
+                    index
+                  ) => (
+                    <div
+                      className={`chat-message ${message.role}`}
+                      key={index}
+                    >
+                      <div className="chat-role">
+                        {message.role ===
+                        "user"
+                          ? "You"
+                          : "ResumeAI"}
+                      </div>
+
+                      <div className="chat-text">
+                        {message.text}
+                      </div>
+                    </div>
+                  )
+                )}
+
+                {chatLoading && (
+                  <div className="chat-message assistant">
+                    <div className="chat-role">
+                      ResumeAI
+                    </div>
+
+                    <div className="chat-text">
+                      Thinking...
+                    </div>
+                  </div>
+                )}
+              </div>
+
+              <div className="chat-input-row">
+                <textarea
+                  value={chatInput}
+                  onChange={(event) =>
+                    setChatInput(
+                      event.target.value
+                    )
+                  }
+                  onKeyDown={
+                    handleChatKeyDown
+                  }
+                  placeholder="Ask about your resume..."
+                  rows={2}
+                  disabled={
+                    chatLoading
+                  }
+                />
+
+                <button
+                  onClick={
+                    sendChatMessage
+                  }
+                  disabled={
+                    chatLoading ||
+                    !chatInput.trim()
+                  }
+                >
+                  Send
+                </button>
+              </div>
+            </div>
+          </section>
+
+          <section className="report-card">
+            <div className="card-heading">
+              <span>🎯</span>
+              Action Plan
+            </div>
+
+            {actionPlan.length >
+            0 ? (
+              <div className="action-plan">
+                {actionPlan.map(
+                  (
+                    item,
+                    index
+                  ) => (
+                    <div
+                      className="action-item"
+                      key={index}
+                    >
+                      <div className="action-number">
+                        {index + 1}
+                      </div>
+
+                      <div>
+                        {item}
+                      </div>
+                    </div>
+                  )
+                )}
+              </div>
+            ) : (
+              <p className="muted">
+                No action items available.
+              </p>
+            )}
+          </section>
+
+          <section className="report-card enhance-card">
+            <div className="card-heading">
+              <span>✨</span>
+              Enhance My Resume
+            </div>
+
+            <div className="enhance-content">
+              <div>
+                <h2>
+                  Create a professional PDF
+                </h2>
+
+                <p>
+                  ResumeAI will improve the
+                  wording and structure while
+                  preserving the actual facts in
+                  your resume.
+                </p>
+
+                <div className="enhance-features">
+                  <span>
+                    ✓ Professional formatting
+                  </span>
+
+                  <span>
+                    ✓ ATS-friendly structure
+                  </span>
+
+                  <span>
+                    ✓ Bold section headings
+                  </span>
+
+                  <span>
+                    ✓ Clean bullet points
+                  </span>
+
+                  <span>
+                    ✓ Original photo preserved
+                    when available
+                  </span>
+
+                  <span>
+                    ✓ Optional photo when not
+                    available
+                  </span>
+                </div>
+              </div>
+
+              {!showEnhancePhotoOptions &&
+                !enhancedResume && (
+                  <button
+                    className="enhance-button"
+                    onClick={
+                      handleEnhanceClick
+                    }
+                    disabled={
+                      enhancing ||
+                      checkingPhoto
+                    }
+                  >
+                    {checkingPhoto
+                      ? "Checking Resume..."
+                      : "Enhance Resume →"}
+                  </button>
+                )}
+            </div>
+
+            {originalPhotoDetected ===
+              true &&
+              enhancing && (
+                <div className="enhance-info">
+                  Original profile photo detected.
+                  Preserving it in the enhanced
+                  resume...
+                </div>
+              )}
+
+            {showEnhancePhotoOptions &&
+              !enhancedResume && (
+                <div className="enhance-photo-options">
+                  <div className="enhance-photo-header">
+                    <h3>
+                      Add a Profile Photo
+                      <span>
+                        {" "}
+                        (Optional)
+                      </span>
+                    </h3>
+
+                    <p>
+                      No profile photo was detected
+                      in your original resume.
+                      You can add one to the
+                      professional PDF or skip it.
+                    </p>
+                  </div>
+
+                  <div className="enhance-photo-actions">
+                    <label className="photo-button">
+                      {photo
+                        ? "Change Photo"
+                        : "Add Photo"}
+
+                      <input
+                        type="file"
+                        accept=".jpg,.jpeg,.png"
+                        onChange={
+                          handlePhotoChange
+                        }
+                        hidden
+                      />
+                    </label>
+
+                    <button
+                      type="button"
+                      className="enhance-button"
+                      onClick={
+                        skipPhotoAndEnhance
+                      }
+                      disabled={
+                        enhancing
+                      }
+                    >
+                      {enhancing
+                        ? "Creating PDF..."
+                        : "Skip Photo & Enhance"}
+                    </button>
+                  </div>
+
+                  {photoPreview && (
+                    <div className="photo-preview-wrap">
+                      <img
+                        src={photoPreview}
+                        alt="Selected profile preview"
+                        className="photo-preview"
+                      />
+
+                      <button
+                        type="button"
+                        className="enhance-button"
+                        onClick={
+                          addPhotoAndEnhance
+                        }
+                        disabled={
+                          enhancing
+                        }
+                      >
+                        {enhancing
+                          ? "Creating PDF..."
+                          : "Create Enhanced Resume"}
+                      </button>
+                    </div>
+                  )}
+                </div>
+              )}
+
+            {enhanceError && (
+              <div className="enhance-error">
+                {enhanceError}
+              </div>
+            )}
+
+            {enhancedResume && (
+              <div className="enhanced-result">
+                <div className="enhanced-result-header">
+                  <div>
+                    <h3>
+                      Professional Resume
+                      Preview
+                    </h3>
+
+                    <p>
+                      Your enhanced resume is
+                      ready.
+                    </p>
+                  </div>
+
+                  <button
+                    className="download-button"
+                    onClick={
+                      downloadEnhancedPDF
+                    }
+                  >
+                    ⬇ Download Professional
+                    PDF
+                  </button>
+                </div>
+
+                <div className="resume-paper">
+                  {renderEnhancedPreview(
+                    enhancedResume
+                  )}
+                </div>
+              </div>
+            )}
+          </section>
+
+          <button
+            className="details-button"
+            onClick={() =>
+              setShowDetails(
+                !showDetails
+              )
+            }
+          >
+            {showDetails
+              ? "Hide Technical Details"
+              : "Show Technical Details"}
+          </button>
+
+          {showDetails && (
+            <section className="report-card technical-details">
+              <div className="card-heading">
+                <span>🔍</span>
+                Technical Details
+              </div>
+
+              <pre>
+                {JSON.stringify(
+                  result,
+                  null,
+                  2
+                )}
+              </pre>
+            </section>
+          )}
         </main>
-
       )}
-
     </div>
   );
 }

@@ -1,1342 +1,3535 @@
-from fastapi import FastAPI, UploadFile, File
-from fastapi.middleware.cors import CORSMiddleware
+import asyncio
+import io
+import json
+import os
+import re
+import uuid
+from typing import Any
 
 import fitz
-from docx import Document
-
-import io
-import re
-import os
 import pytesseract
-from PIL import Image, ImageOps
-
+from PIL import Image
+from docx import Document
 from dotenv import load_dotenv
+from fastapi import BackgroundTasks, FastAPI, File, Form, UploadFile
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel, Field
 from google import genai
+from google.genai import types
 
-
-# =========================
-# APP + GEMINI
-# =========================
 
 load_dotenv()
 
-app = FastAPI()
+app = FastAPI(title="ResumeAI Backend")
 
-gemini_api_key = os.getenv("GEMINI_API_KEY")
-
-gemini_client = None
-
-if gemini_api_key:
-    gemini_client = genai.Client(
-        api_key=gemini_api_key
-    )
-
-
-# =========================
-# TESSERACT OCR
-# =========================
-
-# Windows
-windows_tesseract = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
-
-if os.path.exists(windows_tesseract):
-    pytesseract.pytesseract.tesseract_cmd = windows_tesseract
-
-# On Render/Linux, Tesseract should be available in PATH
-# through the Docker environment.
-
-
-# =========================
-# CORS
-# =========================
 
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
-    allow_credentials=True,
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
 
-# =========================
-# IMAGE OCR
-# =========================
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
 
-def extract_image_text(file_bytes):
+gemini_client = None
 
-    image = Image.open(
-        io.BytesIO(file_bytes)
-    )
-
-    image = ImageOps.exif_transpose(image)
-
-    if image.mode != "RGB":
-        image = image.convert("RGB")
-
-    # Keep OCR reasonably fast
-    max_dimension = 2200
-
-    if max(image.size) > max_dimension:
-        image.thumbnail(
-            (max_dimension, max_dimension),
-            Image.Resampling.LANCZOS
-        )
-
-    text = pytesseract.image_to_string(
-        image,
-        config="--psm 6"
-    )
-
-    return text
+if GEMINI_API_KEY:
+    gemini_client = genai.Client(api_key=GEMINI_API_KEY)
 
 
-# =========================
-# PDF TEXT + OCR
-# =========================
+ai_jobs: dict[str, dict[str, Any]] = {}
+chat_jobs: dict[str, dict[str, Any]] = {}
 
-def extract_pdf_text(file_bytes):
 
-    pdf = fitz.open(
-        stream=file_bytes,
-        filetype="pdf"
-    )
+# =========================================================
+# MODELS
+# =========================================================
 
-    text_parts = []
+class ChatRequest(BaseModel):
+    job_id: str
+    message: str = Field(min_length=1, max_length=4000)
 
-    # First try normal PDF text extraction.
-    # This is much faster than OCR.
-    for page in pdf:
-        page_text = page.get_text()
 
-        if page_text:
-            text_parts.append(page_text)
+class FeedbackSchema(BaseModel):
+    overall_advice: str
+    high_priority_issues: list[str]
+    medium_priority_issues: list[str]
+    strengths: list[str]
+    actionable_suggestions: list[str]
 
-    normal_text = "\n".join(
-        text_parts
-    ).strip()
 
-    # Normal text PDF -> return immediately.
-    if len(normal_text) >= 100:
-        pdf.close()
-        return normal_text
+# =========================================================
+# TEXT EXTRACTION
+# =========================================================
 
-    # Scanned/image PDF -> OCR
-    ocr_text = []
+def clean_text(text: str) -> str:
+    text = text.replace("\x00", " ")
+    text = re.sub(r"[ \t]+", " ", text)
+    text = re.sub(r"\n\s*\n\s*\n+", "\n\n", text)
+    return text.strip()
 
-    for page in pdf:
 
-        # 150 DPI keeps OCR reasonably fast.
-        pix = page.get_pixmap(
-            dpi=150,
-            alpha=False
-        )
+def extract_from_pdf(data: bytes) -> str:
+    doc = fitz.open(stream=data, filetype="pdf")
 
-        image = Image.open(
-            io.BytesIO(
-                pix.tobytes("png")
+    pages = []
+
+    for page in doc:
+        text = page.get_text("text").strip()
+
+        if text:
+            pages.append(text)
+
+    extracted = "\n\n".join(pages)
+
+    # OCR fallback for scanned/image PDFs
+    if len(extracted.strip()) < 120:
+        ocr_pages = []
+
+        for page in doc:
+            pix = page.get_pixmap(
+                matrix=fitz.Matrix(1.5, 1.5),
+                alpha=False,
             )
-        )
 
-        if image.mode != "RGB":
-            image = image.convert("RGB")
+            image = Image.frombytes(
+                "RGB",
+                [pix.width, pix.height],
+                pix.samples,
+            )
 
-        page_text = pytesseract.image_to_string(
-            image,
-            config="--psm 6"
-        )
+            ocr_text = pytesseract.image_to_string(image)
 
-        if page_text:
-            ocr_text.append(page_text)
+            if ocr_text.strip():
+                ocr_pages.append(ocr_text)
 
-    pdf.close()
+        extracted = "\n\n".join(ocr_pages)
 
-    return "\n".join(
-        ocr_text
-    )
+    doc.close()
+
+    return clean_text(extracted)
 
 
-# =========================
-# DOCX TEXT
-# =========================
+def extract_from_docx(data: bytes) -> str:
+    document = Document(io.BytesIO(data))
 
-def extract_docx_text(file_bytes):
+    parts = []
 
-    document = Document(
-        io.BytesIO(file_bytes)
-    )
-
-    text = []
-
-    # Normal paragraphs
     for paragraph in document.paragraphs:
+        if paragraph.text.strip():
+            parts.append(paragraph.text)
 
-        paragraph_text = paragraph.text.strip()
-
-        if paragraph_text:
-            text.append(
-                paragraph_text
-            )
-
-    # Resume tables
     for table in document.tables:
-
         for row in table.rows:
+            cells = [
+                cell.text.strip()
+                for cell in row.cells
+                if cell.text.strip()
+            ]
 
-            for cell in row.cells:
+            if cells:
+                parts.append(" | ".join(cells))
 
-                cell_text = cell.text.strip()
-
-                if cell_text:
-                    text.append(
-                        cell_text
-                    )
-
-    return "\n".join(text)
+    return clean_text("\n".join(parts))
 
 
-# =========================
-# TEXT QUALITY CHECK
-# =========================
+def extract_from_image(data: bytes) -> str:
+    image = Image.open(io.BytesIO(data))
+    image = image.convert("RGB")
 
-def text_quality_is_reasonable(text):
+    text = pytesseract.image_to_string(image)
 
-    cleaned = re.sub(
-        r"\s+",
-        " ",
-        text
-    ).strip()
+    return clean_text(text)
 
-    if len(cleaned) < 50:
-        return False
 
-    # Count alphabetic characters.
-    letters = len(
-        re.findall(
-            r"[A-Za-z]",
-            cleaned
+async def extract_resume_text(
+    filename: str,
+    data: bytes,
+) -> str:
+
+    extension = os.path.splitext(filename)[1].lower()
+
+    if extension == ".pdf":
+        return await asyncio.to_thread(
+            extract_from_pdf,
+            data,
         )
+
+    if extension == ".docx":
+        return await asyncio.to_thread(
+            extract_from_docx,
+            data,
+        )
+
+    if extension in [".jpg", ".jpeg", ".png"]:
+        return await asyncio.to_thread(
+            extract_from_image,
+            data,
+        )
+
+    raise ValueError(
+        "Unsupported file format. Please upload PDF, DOCX, JPG or PNG."
     )
 
-    # A resume should contain a reasonable amount
-    # of readable alphabetic text.
-    if letters < 30:
-        return False
 
-    # OCR corruption indicator.
-    # If too many strange symbols appear, reject it.
-    strange_chars = len(
-        re.findall(
-            r"[^A-Za-z0-9\s@.,:;()/&+#%\-_'|]",
-            cleaned
-        )
-    )
-
-    if len(cleaned) > 100:
-        strange_ratio = (
-            strange_chars / len(cleaned)
-        )
-
-        if strange_ratio > 0.20:
-            return False
-
-    return True
-
-
-# =========================
+# =========================================================
 # RESUME VALIDATION
-# =========================
+# =========================================================
 
-def looks_like_resume(text):
+def looks_like_resume(text: str) -> bool:
+    lower = text.lower()
 
-    text_lower = re.sub(
-        r"\s+",
-        " ",
-        text.lower()
-    ).strip()
-
-    if len(text_lower) < 80:
-        return False
-
-    if not text_quality_is_reasonable(text):
-        return False
-
-    # -------------------------
-    # Clearly non-resume documents
-    # -------------------------
-
-    non_resume_signals = [
-        "marksheet",
-        "mark sheet",
-        "statement of marks",
-        "grade sheet",
-        "marks obtained",
-        "total marks",
-        "subject code",
-        "semester result",
-        "examination result",
-        "academic transcript",
-        "transcript of records",
-        "fee receipt",
-        "payment receipt",
-        "invoice",
-        "purchase order",
-        "bank statement",
-        "admit card",
-        "question paper",
-        "hall ticket",
-        "fee challan",
-        "medical report",
-        "prescription",
-        "laboratory report",
-        "test report"
+    resume_terms = [
+        "resume",
+        "curriculum vitae",
+        "experience",
+        "education",
+        "skills",
+        "projects",
+        "internship",
+        "objective",
+        "summary",
+        "certification",
+        "professional",
+        "work experience",
+        "technical skills",
+        "employment",
+        "career",
+        "achievements",
     ]
 
-    negative_score = sum(
+    hits = sum(
         1
-        for signal in non_resume_signals
-        if signal in text_lower
+        for term in resume_terms
+        if term in lower
     )
 
-    # One very strong document-type signal can be enough
-    # when combined with other obvious result-document terms.
-    strong_non_resume = [
-        "statement of marks",
-        "marks obtained",
-        "total marks",
-        "semester result",
-        "examination result",
-        "academic transcript",
-        "transcript of records",
-        "fee receipt",
-        "payment receipt",
-        "bank statement",
-        "admit card",
-        "question paper"
-    ]
-
-    if any(
-        signal in text_lower
-        for signal in strong_non_resume
-    ):
-        return False
-
-    if negative_score >= 2:
-        return False
-
-    # -------------------------
-    # Resume section categories
-    # -------------------------
-
-    resume_signals = {
-
-        "education": [
-            "education",
-            "academic background",
-            "b.tech",
-            "btech",
-            "bachelor",
-            "bachelors",
-            "degree",
-            "university",
-            "college",
-            "school"
-        ],
-
-        "skills": [
-            "skills",
-            "technical skills",
-            "technologies",
-            "technical expertise",
-            "programming skills"
-        ],
-
-        "experience": [
-            "experience",
-            "work experience",
-            "employment",
-            "professional experience",
-            "work history"
-        ],
-
-        "projects": [
-            "projects",
-            "project experience",
-            "academic projects"
-        ],
-
-        "internship": [
-            "internship",
-            "intern",
-            "industrial training"
-        ],
-
-        "profile": [
-            "summary",
-            "professional summary",
-            "profile",
-            "objective",
-            "career objective",
-            "about me"
-        ],
-
-        "certifications": [
-            "certifications",
-            "certificates",
-            "certification"
-        ],
-
-        "achievements": [
-            "achievements",
-            "awards",
-            "honors",
-            "accomplishments"
-        ],
-
-        "professional_links": [
-            "linkedin",
-            "github",
-            "portfolio"
-        ]
-    }
-
-    categories_found = 0
-
-    for keywords in resume_signals.values():
-
-        if any(
-            keyword in text_lower
-            for keyword in keywords
-        ):
-            categories_found += 1
-
-    # -------------------------
-    # Contact evidence
-    # -------------------------
-
-    email_found = bool(
+    email = bool(
         re.search(
-            r"[\w\.-]+@[\w\.-]+\.\w+",
-            text_lower
+            r"\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b",
+            text,
+            re.I,
         )
     )
 
-    phone_found = bool(
+    phone = bool(
         re.search(
             r"(?:\+91[\s-]?)?[6-9]\d{9}",
-            text_lower
-        )
-    )
-
-    linkedin_found = bool(
-        re.search(
-            r"linkedin(?:\.com)?",
-            text_lower
-        )
-    )
-
-    github_found = bool(
-        re.search(
-            r"github(?:\.com)?",
-            text_lower
-        )
-    )
-
-    contact_found = (
-        email_found
-        or phone_found
-        or linkedin_found
-        or github_found
-    )
-
-    # -------------------------
-    # Technical skill evidence
-    # -------------------------
-
-    technical_terms = [
-        "python",
-        "java",
-        "javascript",
-        "typescript",
-        "c++",
-        "c#",
-        "react",
-        "node.js",
-        "nodejs",
-        "html",
-        "css",
-        "sql",
-        "mongodb",
-        "mysql",
-        "postgresql",
-        "fastapi",
-        "django",
-        "flask",
-        "git",
-        "github",
-        "docker",
-        "aws",
-        "azure",
-        "machine learning",
-        "deep learning",
-        "artificial intelligence",
-        "data analysis",
-        "pandas",
-        "numpy",
-        "tensorflow",
-        "pytorch",
-        "power bi",
-        "excel"
-    ]
-
-    skill_count = sum(
-        1
-        for skill in technical_terms
-        if skill in text_lower
-    )
-
-    # -------------------------
-    # Professional activity evidence
-    # -------------------------
-
-    activity_terms = [
-        "developed",
-        "created",
-        "built",
-        "designed",
-        "implemented",
-        "deployed",
-        "integrated",
-        "programmed",
-        "engineered",
-        "analyzed",
-        "tested",
-        "optimized",
-        "managed",
-        "worked on",
-        "responsible for"
-    ]
-
-    activity_count = sum(
-        1
-        for activity in activity_terms
-        if activity in text_lower
-    )
-
-    # -------------------------
-    # Strong resume identity
-    # -------------------------
-
-    explicit_resume_identity = any(
-        phrase in text_lower
-        for phrase in [
-            "resume",
-            "curriculum vitae",
-            "cv"
-        ]
-    )
-
-    # -------------------------
-    # Final validation rules
-    # -------------------------
-
-    # Very strong case:
-    # several resume categories + contact.
-    if categories_found >= 4 and contact_found:
-        return True
-
-    # Strong case:
-    # categories + technical skills + contact.
-    if (
-        categories_found >= 3
-        and skill_count >= 2
-        and contact_found
-    ):
-        return True
-
-    # Technical/student resume without contact:
-    # several categories + multiple skills + activity.
-    if (
-        categories_found >= 4
-        and skill_count >= 2
-        and activity_count >= 1
-    ):
-        return True
-
-    # Explicit resume/CV with supporting structure.
-    if (
-        explicit_resume_identity
-        and categories_found >= 3
-        and (
-            contact_found
-            or skill_count >= 2
-        )
-    ):
-        return True
-
-    # Non-technical resumes can still be valid.
-    # Require stronger structure for them.
-    if (
-        categories_found >= 5
-        and contact_found
-        and activity_count >= 1
-    ):
-        return True
-
-    return False
-
-
-# =========================
-# HELPERS
-# =========================
-
-def find_first(text, patterns):
-
-    for pattern in patterns:
-
-        match = re.search(
-            pattern,
             text,
-            re.IGNORECASE
         )
+    )
 
-        if match:
-            return match.group(0)
+    return (
+        hits >= 3
+        or (hits >= 2 and (email or phone))
+    )
 
-    return None
 
-
-# =========================
+# =========================================================
 # SECTION DETECTION
-# =========================
+# =========================================================
 
-def detect_sections(text):
+SECTION_PATTERNS = {
+    "contact": [
+        "contact",
+        "email",
+        "phone",
+        "mobile",
+        "linkedin",
+        "github",
+    ],
+    "summary": [
+        "summary",
+        "professional summary",
+        "profile",
+        "objective",
+        "about me",
+    ],
+    "education": [
+        "education",
+        "academic",
+        "b.tech",
+        "btech",
+        "bachelor",
+        "degree",
+        "university",
+        "college",
+    ],
+    "skills": [
+        "skills",
+        "technical skills",
+        "core skills",
+        "technologies",
+    ],
+    "experience": [
+        "experience",
+        "work experience",
+        "professional experience",
+        "employment",
+    ],
+    "internship": [
+        "internship",
+        "internships",
+        "intern",
+    ],
+    "projects": [
+        "projects",
+        "project",
+        "academic projects",
+    ],
+    "certifications": [
+        "certifications",
+        "certification",
+        "certificates",
+    ],
+    "achievements": [
+        "achievements",
+        "achievement",
+        "awards",
+        "honors",
+    ],
+}
 
-    text_lower = text.lower()
 
-    section_keywords = {
+SKILLS = [
+    "python",
+    "java",
+    "javascript",
+    "typescript",
+    "c",
+    "c++",
+    "c#",
+    "html",
+    "css",
+    "react",
+    "react.js",
+    "node.js",
+    "express",
+    "fastapi",
+    "flask",
+    "django",
+    "sql",
+    "mysql",
+    "postgresql",
+    "mongodb",
+    "git",
+    "github",
+    "docker",
+    "aws",
+    "azure",
+    "machine learning",
+    "deep learning",
+    "artificial intelligence",
+    "data analysis",
+    "pandas",
+    "numpy",
+    "matplotlib",
+    "tensorflow",
+    "pytorch",
+    "power bi",
+    "excel",
+    "figma",
+    "rest api",
+    "api",
+]
 
-        "Contact Information": [
-            "email",
-            "phone",
-            "linkedin",
-            "github",
-            "portfolio"
-        ],
 
-        "Summary": [
-            "summary",
-            "profile",
-            "objective",
-            "professional summary"
-        ],
+ACTION_VERBS = [
+    "developed",
+    "built",
+    "created",
+    "designed",
+    "implemented",
+    "optimized",
+    "improved",
+    "automated",
+    "managed",
+    "led",
+    "analyzed",
+    "deployed",
+    "engineered",
+    "integrated",
+    "tested",
+    "delivered",
+    "configured",
+    "maintained",
+    "develop",
+    "build",
+    "create",
+    "design",
+    "implement",
+    "optimize",
+    "improve",
+    "automate",
+    "manage",
+    "lead",
+    "analyze",
+    "deploy",
+    "solve",
+    "solved",
+    "launched",
+    "migrated",
+    "refactored",
+]
 
-        "Education": [
-            "education",
-            "academic",
-            "b.tech",
-            "btech",
-            "bachelor",
-            "degree",
-            "university",
-            "college"
-        ],
 
-        "Skills": [
-            "skills",
-            "technical skills",
-            "technologies",
-            "programming skills"
-        ],
+GENERIC_PHRASES = [
+    "hardworking",
+    "hard working",
+    "quick learner",
+    "team player",
+    "passionate individual",
+    "self motivated",
+    "self-motivated",
+    "good communication skills",
+    "excellent communication skills",
+    "seeking a challenging position",
+    "looking for a challenging opportunity",
+    "to work in a reputed organization",
+    "where i can utilize my skills",
+    "where i can grow",
+    "highly motivated",
+    "dedicated individual",
+    "responsible individual",
+]
 
-        "Experience": [
-            "experience",
-            "work experience",
-            "employment",
-            "professional experience"
-        ],
 
-        "Internship": [
-            "internship",
-            "intern"
-        ],
+WEAK_BULLET_PHRASES = [
+    "responsible for",
+    "worked on",
+    "helped with",
+    "helped in",
+    "involved in",
+    "did",
+    "made",
+    "was responsible",
+]
 
-        "Projects": [
-            "projects",
-            "project"
-        ],
 
-        "Certifications": [
-            "certifications",
-            "certificates",
-            "certification"
-        ],
-
-        "Achievements": [
-            "achievements",
-            "awards",
-            "honors"
-        ]
-    }
+def detect_sections(text: str) -> list[str]:
+    lower = text.lower()
 
     detected = []
 
-    for section, keywords in section_keywords.items():
-
-        for keyword in keywords:
-
-            if keyword in text_lower:
-
-                detected.append(section)
-
-                break
+    for section, keywords in SECTION_PATTERNS.items():
+        if any(
+            keyword in lower
+            for keyword in keywords
+        ):
+            detected.append(section)
 
     return detected
 
 
-# =========================
-# SKILL DETECTION
-# =========================
-
-def detect_skills(text):
-
-    skills_list = [
-        "python",
-        "java",
-        "javascript",
-        "typescript",
-        "react",
-        "node.js",
-        "nodejs",
-        "html",
-        "css",
-        "sql",
-        "mongodb",
-        "mysql",
-        "postgresql",
-        "fastapi",
-        "django",
-        "flask",
-        "c++",
-        "c#",
-        "git",
-        "github",
-        "docker",
-        "aws",
-        "azure",
-        "machine learning",
-        "deep learning",
-        "artificial intelligence",
-        "data analysis",
-        "pandas",
-        "numpy",
-        "tensorflow",
-        "pytorch",
-        "excel",
-        "power bi"
-    ]
-
-    text_lower = text.lower()
+def detect_skills(text: str) -> list[str]:
+    lower = text.lower()
 
     found = []
 
-    for skill in skills_list:
+    for skill in SKILLS:
+        pattern = re.escape(skill.lower())
 
-        if skill in text_lower:
+        if re.search(
+            rf"(?<![a-z0-9]){pattern}(?![a-z0-9])",
+            lower,
+        ):
             found.append(skill)
 
-    return sorted(
-        set(found)
-    )
+    return list(dict.fromkeys(found))
 
 
-# =========================
-# METRICS
-# =========================
-
-def detect_metrics(text):
-
+def detect_metrics(text: str) -> list[str]:
     patterns = [
-        r"\b\d+%",
+        r"\b\d+(?:\.\d+)?%",
         r"\b\d+\+",
-        r"\b\d+\s*(?:users|customers|projects|clients|members)",
-        r"\b\d+(?:,\d{3})\s*(?:records|rows|items)",
-        r"\b\d+(?:\.\d+)?\s*(?:seconds|ms|hours|days|months|years)"
+        r"\b\d+\s+(?:users|clients|customers|students|members|projects|employees|records|requests)\b",
+        r"\b\d+\s+(?:days|months|years|weeks)\b",
+        r"\b\d+(?:\.\d+)?\s*(?:k|m|million|billion)\b",
+        r"\b(?:increased|decreased|reduced|improved|saved|grew|cut)\b.{0,50}?\b\d+(?:\.\d+)?%?",
     ]
 
     results = []
 
     for pattern in patterns:
-
-        matches = re.findall(
-            pattern,
-            text,
-            re.IGNORECASE
+        results.extend(
+            re.findall(
+                pattern,
+                text,
+                re.I,
+            )
         )
 
-        results.extend(matches)
-
-    return list(
-        dict.fromkeys(results)
-    )
+    return list(dict.fromkeys(results))[:30]
 
 
-# =========================
-# ACTION VERBS
-# =========================
-
-def detect_action_verbs(text):
-
-    action_verbs = [
-        "developed",
-        "created",
-        "built",
-        "designed",
-        "implemented",
-        "managed",
-        "led",
-        "analyzed",
-        "improved",
-        "optimized",
-        "automated",
-        "tested",
-        "deployed",
-        "integrated",
-        "configured",
-        "maintained",
-        "engineered",
-        "delivered"
-    ]
-
-    text_lower = text.lower()
+def detect_action_verbs(text: str) -> list[str]:
+    lower = text.lower()
 
     found = []
 
-    for verb in action_verbs:
-
+    for verb in ACTION_VERBS:
         if re.search(
-            r"\b" + re.escape(verb) + r"\b",
-            text_lower
+            rf"\b{re.escape(verb)}\b",
+            lower,
         ):
-
             found.append(verb)
 
-    return sorted(
-        set(found)
+    return list(dict.fromkeys(found))
+
+
+def detect_generic_phrases(text: str) -> list[str]:
+    lower = text.lower()
+
+    found = []
+
+    for phrase in GENERIC_PHRASES:
+        if phrase in lower:
+            found.append(phrase)
+
+    return found
+
+
+def detect_weak_bullets(text: str) -> list[str]:
+    lower = text.lower()
+
+    found = []
+
+    for phrase in WEAK_BULLET_PHRASES:
+        if phrase in lower:
+            found.append(phrase)
+
+    return found
+
+
+def extract_bullets(text: str) -> list[str]:
+    lines = text.splitlines()
+
+    bullets = []
+
+    for line in lines:
+        cleaned = line.strip()
+
+        if not cleaned:
+            continue
+
+        if re.match(
+            r"^[•●▪◦‣*-]\s+",
+            cleaned,
+        ):
+            bullets.append(cleaned)
+
+        elif re.match(
+            r"^\d+[.)]\s+",
+            cleaned,
+        ):
+            bullets.append(cleaned)
+
+    return bullets
+
+
+def count_meaningful_lines(text: str) -> int:
+    lines = [
+        line.strip()
+        for line in text.splitlines()
+        if line.strip()
+    ]
+
+    return len(lines)
+
+
+def count_email_addresses(text: str) -> int:
+    return len(
+        re.findall(
+            r"\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b",
+            text,
+            re.I,
+        )
     )
 
 
-# =========================
-# RULE-BASED ANALYSIS
-# =========================
+# =========================================================
+# QUALITY ANALYSIS
+# =========================================================
 
-def analyze_resume_text(text):
+def analyze_summary_quality(
+    text: str,
+    sections: list[str],
+) -> tuple[int, list[str], list[str]]:
+
+    lower = text.lower()
+
+    if "summary" not in sections:
+        return (
+            0,
+            [],
+            ["Add a focused professional summary for the target role."],
+        )
+
+    summary_match = re.search(
+        r"(?:professional summary|summary|profile|objective|about me)"
+        r"(.*?)(?=\n\s*(?:education|skills|technical skills|experience|work experience|projects|internship|certifications|achievements)\b|$)",
+        text,
+        re.I | re.S,
+    )
+
+    if summary_match:
+        summary = summary_match.group(1).strip()
+    else:
+        summary = ""
+
+    words = re.findall(
+        r"\b\w+\b",
+        summary,
+    )
+
+    score = 0
+    strengths = []
+    suggestions = []
+
+    if len(words) >= 25:
+        score += 3
+    elif len(words) >= 12:
+        score += 2
+    else:
+        suggestions.append(
+            "Expand the summary with a concise description of your role, technical focus and career direction."
+        )
+
+    role_terms = [
+        "developer",
+        "engineer",
+        "designer",
+        "analyst",
+        "student",
+        "intern",
+        "manager",
+        "specialist",
+        "scientist",
+        "consultant",
+    ]
+
+    if any(term in lower for term in role_terms):
+        score += 2
+
+    if any(
+        skill in lower
+        for skill in detect_skills(text)
+    ):
+        score += 2
+
+    if any(
+        phrase in lower
+        for phrase in GENERIC_PHRASES
+    ):
+        score -= 2
+        suggestions.append(
+            "Replace generic self-descriptions with specific evidence, skills and career focus."
+        )
+
+    if re.search(
+        r"\b(experience|experienced|built|developed|implemented|created)\b",
+        summary,
+        re.I,
+    ):
+        score += 2
+
+    if re.search(
+        r"\b(?:python|java|javascript|react|sql|fastapi|machine learning|data analysis|aws|docker)\b",
+        summary,
+        re.I,
+    ):
+        score += 1
+
+    score = max(0, min(score, 10))
+
+    if score >= 8:
+        strengths.append(
+            "The professional summary is specific and relevant."
+        )
+    elif score >= 5:
+        suggestions.append(
+            "Make the summary more specific to the target role and technical strengths."
+        )
+    else:
+        suggestions.append(
+            "The summary is too weak or generic to communicate a clear professional value proposition."
+        )
+
+    return score, strengths, suggestions
+
+
+def analyze_contact_quality(
+    text: str,
+) -> tuple[int, list[str], list[str]]:
+
+    lower = text.lower()
+
+    email_found = count_email_addresses(text) > 0
+
+    phone_found = bool(
+        re.search(
+            r"(?:\+91[\s-]?)?[6-9]\d{9}",
+            text,
+        )
+    )
+
+    linkedin_found = "linkedin.com" in lower
+    github_found = "github.com" in lower
+
+    score = 0
+    strengths = []
+    suggestions = []
+
+    if email_found:
+        score += 4
+        strengths.append(
+            "A professional email address is present."
+        )
+    else:
+        suggestions.append(
+            "Add a professional email address."
+        )
+
+    if phone_found:
+        score += 3
+        strengths.append(
+            "A reachable phone number is present."
+        )
+    else:
+        suggestions.append(
+            "Add a reachable phone number."
+        )
+
+    if linkedin_found:
+        score += 2
+        strengths.append(
+            "A LinkedIn profile is included."
+        )
+    else:
+        suggestions.append(
+            "Add a LinkedIn profile URL if available."
+        )
+
+    if github_found:
+        score += 1
+        strengths.append(
+            "A GitHub profile is included."
+        )
+
+    return score, strengths, suggestions
+
+
+def analyze_skills_quality(
+    text: str,
+    skills: list[str],
+) -> tuple[int, list[str], list[str]]:
+
+    lower = text.lower()
+
+    if "skills" not in detect_sections(text):
+        return (
+            0,
+            [],
+            ["Add a dedicated Skills section containing relevant skills."],
+        )
+
+    score = 3
+    strengths = []
+    suggestions = []
+
+    if len(skills) >= 8:
+        score += 4
+    elif len(skills) >= 5:
+        score += 3
+    elif len(skills) >= 3:
+        score += 2
+    elif len(skills) >= 1:
+        score += 1
+    else:
+        suggestions.append(
+            "The Skills section does not contain enough recognizable technical skills."
+        )
+
+    evidence_skills = 0
+
+    for skill in skills:
+        occurrences = len(
+            re.findall(
+                re.escape(skill),
+                lower,
+                re.I,
+            )
+        )
+
+        if occurrences >= 2:
+            evidence_skills += 1
+
+    if evidence_skills >= 4:
+        score += 2
+        strengths.append(
+            "Several listed skills are supported by other resume content."
+        )
+    elif skills and evidence_skills == 0:
+        suggestions.append(
+            "Provide evidence for listed skills through projects, experience or achievements instead of relying only on a keyword list."
+        )
+
+    if len(skills) >= 5:
+        strengths.append(
+            f"{len(skills)} technical skills were detected."
+        )
+
+    return max(0, min(score, 10)), strengths, suggestions
+
+
+def analyze_project_quality(
+    text: str,
+    skills: list[str],
+    metrics: list[str],
+    action_verbs: list[str],
+) -> tuple[int, list[str], list[str]]:
+
+    sections = detect_sections(text)
+
+    if "projects" not in sections:
+        return (
+            0,
+            [],
+            ["Add relevant projects with technologies, responsibilities and outcomes."],
+        )
+
+    lower = text.lower()
+
+    score = 4
+    strengths = []
+    suggestions = []
+
+    project_keywords = [
+        "developed",
+        "built",
+        "created",
+        "implemented",
+        "designed",
+        "application",
+        "website",
+        "system",
+        "platform",
+        "api",
+        "model",
+        "dashboard",
+    ]
+
+    project_evidence = sum(
+        1
+        for word in project_keywords
+        if word in lower
+    )
+
+    if project_evidence >= 5:
+        score += 3
+    elif project_evidence >= 3:
+        score += 2
+    elif project_evidence >= 1:
+        score += 1
+
+    if len(skills) >= 3:
+        score += 1
+
+    if action_verbs:
+        score += 1
+
+    if metrics:
+        score += 1
+
+    if score >= 8:
+        strengths.append(
+            "Projects contain meaningful technical implementation evidence."
+        )
+
+    if not action_verbs:
+        suggestions.append(
+            "Use strong action verbs to explain what you personally built or implemented."
+        )
+
+    if not metrics:
+        suggestions.append(
+            "Where truthful, add measurable project outcomes such as performance, users, scale, time saved or accuracy."
+        )
+
+    if len(skills) < 3:
+        suggestions.append(
+            "Mention the technologies actually used in each project."
+        )
+
+    return max(0, min(score, 15)), strengths, suggestions
+
+
+def analyze_experience_quality(
+    text: str,
+    action_verbs: list[str],
+    metrics: list[str],
+) -> tuple[int, list[str], list[str]]:
+
+    sections = detect_sections(text)
+
+    has_experience = (
+        "experience" in sections
+        or "internship" in sections
+    )
+
+    if not has_experience:
+        return (
+            0,
+            [],
+            [],
+        )
+
+    score = 5
+    strengths = []
+    suggestions = []
+
+    bullets = extract_bullets(text)
+
+    if len(bullets) >= 5:
+        score += 3
+    elif len(bullets) >= 3:
+        score += 2
+    elif len(bullets) >= 1:
+        score += 1
+    else:
+        suggestions.append(
+            "Describe experience using concise achievement-oriented bullet points."
+        )
+
+    if action_verbs:
+        score += 2
+
+    if metrics:
+        score += 3
+
+    weak_bullets = detect_weak_bullets(text)
+
+    if weak_bullets:
+        score -= 2
+        suggestions.append(
+            "Replace passive phrases such as 'worked on' or 'responsible for' with specific actions and outcomes."
+        )
+
+    if metrics:
+        strengths.append(
+            "Experience includes measurable evidence."
+        )
+
+    if action_verbs:
+        strengths.append(
+            "Action-oriented language is used in the resume."
+        )
+
+    return max(0, min(score, 15)), strengths, suggestions
+
+
+def analyze_impact_quality(
+    text: str,
+    metrics: list[str],
+    action_verbs: list[str],
+) -> tuple[int, list[str], list[str]]:
+
+    score = 0
+    strengths = []
+    suggestions = []
+
+    bullets = extract_bullets(text)
+
+    if metrics:
+        score += 5
+        strengths.append(
+            "The resume contains measurable results or scale indicators."
+        )
+
+    if action_verbs:
+        score += 2
+
+    if bullets:
+        strong_bullets = 0
+
+        for bullet in bullets:
+            words = re.findall(
+                r"\b\w+\b",
+                bullet,
+            )
+
+            if len(words) >= 8:
+                strong_bullets += 1
+
+        if strong_bullets >= 4:
+            score += 2
+        elif strong_bullets >= 2:
+            score += 1
+
+    generic = detect_generic_phrases(text)
+
+    if generic:
+        score -= min(
+            2,
+            len(generic),
+        )
+
+        suggestions.append(
+            "Replace generic claims with concrete evidence and outcomes."
+        )
+
+    if not metrics:
+        suggestions.append(
+            "Add truthful numbers or measurable outcomes to demonstrate impact."
+        )
+
+    return max(0, min(score, 10)), strengths, suggestions
+
+
+def analyze_ats_quality(
+    text: str,
+    sections: list[str],
+    word_count: int,
+) -> tuple[int, list[str], list[str]]:
+
+    score = 0
+    strengths = []
+    suggestions = []
+
+    if len(sections) >= 5:
+        score += 3
+    elif len(sections) >= 3:
+        score += 2
+    elif len(sections) >= 1:
+        score += 1
+
+    if 300 <= word_count <= 900:
+        score += 3
+        strengths.append(
+            "Resume content length is within a generally practical range."
+        )
+    elif 180 <= word_count < 300:
+        score += 2
+        suggestions.append(
+            "The resume is short; add relevant evidence rather than filler."
+        )
+    elif word_count > 1100:
+        score += 1
+        suggestions.append(
+            "The resume is long; remove repetitive or low-value content."
+        )
+    else:
+        suggestions.append(
+            "The resume contains very little professional content."
+        )
+
+    formatting_noise = len(
+        re.findall(
+            r"[|]{3,}|[_]{3,}|[.]{5,}|[-]{5,}",
+            text,
+        )
+    )
+
+    if formatting_noise == 0:
+        score += 2
+    else:
+        suggestions.append(
+            "Reduce excessive decorative separators or formatting noise for cleaner ATS parsing."
+        )
+
+    if count_email_addresses(text) <= 1:
+        score += 1
+    else:
+        suggestions.append(
+            "Keep one primary professional email address."
+        )
+
+    generic = detect_generic_phrases(text)
+
+    if not generic:
+        score += 1
+    else:
+        suggestions.append(
+            "Remove generic resume phrases and replace them with role-specific evidence."
+        )
+
+    return max(0, min(score, 10)), strengths, suggestions
+
+
+# =========================================================
+# STRICT SCORE ENGINE
+# =========================================================
+
+def analyze_resume_text(text: str) -> dict[str, Any]:
 
     sections = detect_sections(text)
     skills = detect_skills(text)
     metrics = detect_metrics(text)
     action_verbs = detect_action_verbs(text)
 
-    score = 0
-
-    breakdown = {}
-
-    # Sections
-    section_score = min(
-        len(sections) * 5,
-        30
-    )
-
-    score += section_score
-
-    breakdown["Sections"] = section_score
-
-    # Skills
-    skill_score = min(
-        len(skills) * 2,
-        20
-    )
-
-    score += skill_score
-
-    breakdown["Skills"] = skill_score
-
-    # Action verbs
-    verb_score = min(
-        len(action_verbs) * 2,
-        15
-    )
-
-    score += verb_score
-
-    breakdown["Action Verbs"] = verb_score
-
-    # Metrics
-    metric_score = min(
-        len(metrics) * 3,
-        15
-    )
-
-    score += metric_score
-
-    breakdown["Quantified Results"] = metric_score
-
-    # Contact
-    email_found = bool(
-        re.search(
-            r"[\w\.-]+@[\w\.-]+\.\w+",
-            text
+    word_count = len(
+        re.findall(
+            r"\b\w+\b",
+            text,
         )
     )
 
-    phone_found = bool(
-        re.search(
-            r"(?:\+91[\s-]?)?[6-9]\d{9}",
-            text
+    meaningful_lines = count_meaningful_lines(text)
+
+    contact_score, contact_strengths, contact_suggestions = (
+        analyze_contact_quality(text)
+    )
+
+    summary_score, summary_strengths, summary_suggestions = (
+        analyze_summary_quality(
+            text,
+            sections,
         )
     )
 
-    linkedin_found = (
-        "linkedin" in text.lower()
+    education_score = (
+        8
+        if "education" in sections
+        else 0
     )
 
-    github_found = (
-        "github" in text.lower()
+    education_strengths = []
+    education_suggestions = []
+
+    if education_score:
+        education_strengths.append(
+            "Education information is present."
+        )
+    else:
+        education_suggestions.append(
+            "Add an Education section with degree, institution and relevant details."
+        )
+
+    skills_score, skills_strengths, skills_suggestions = (
+        analyze_skills_quality(
+            text,
+            skills,
+        )
     )
 
-    contact_score = 0
-
-    if email_found:
-        contact_score += 3
-
-    if phone_found:
-        contact_score += 3
-
-    if linkedin_found:
-        contact_score += 2
-
-    if github_found:
-        contact_score += 2
-
-    score += contact_score
-
-    breakdown["Contact Information"] = contact_score
-
-    score = min(
-        score,
-        100
+    project_score, project_strengths, project_suggestions = (
+        analyze_project_quality(
+            text,
+            skills,
+            metrics,
+            action_verbs,
+        )
     )
 
-    # =========================
-    # STRENGTHS
-    # =========================
-
-    strengths = []
-
-    if "Education" in sections:
-        strengths.append(
-            "Education section is clearly present."
+    experience_score, experience_strengths, experience_suggestions = (
+        analyze_experience_quality(
+            text,
+            action_verbs,
+            metrics,
         )
+    )
 
-    if len(skills) >= 3:
-        strengths.append(
-            "Good number of technical skills detected."
+    impact_score, impact_strengths, impact_suggestions = (
+        analyze_impact_quality(
+            text,
+            metrics,
+            action_verbs,
         )
+    )
 
-    if "Projects" in sections:
-        strengths.append(
-            "Projects section is present."
+    ats_score, ats_strengths, ats_suggestions = (
+        analyze_ats_quality(
+            text,
+            sections,
+            word_count,
         )
+    )
 
-    if "Experience" in sections:
-        strengths.append(
-            "Work experience is included."
+    certification_bonus = (
+        2
+        if "certifications" in sections
+        else 0
+    )
+
+    achievement_bonus = (
+        2
+        if "achievements" in sections
+        else 0
+    )
+
+    if "experience" in sections:
+        experience_presence_bonus = 3
+    elif "internship" in sections:
+        experience_presence_bonus = 2
+    else:
+        experience_presence_bonus = 0
+
+    score = (
+        contact_score
+        + summary_score
+        + education_score
+        + skills_score
+        + project_score
+        + experience_score
+        + impact_score
+        + ats_score
+        + certification_bonus
+        + achievement_bonus
+        + experience_presence_bonus
+    )
+
+    score = max(
+        0,
+        min(
+            score,
+            100,
+        ),
+    )
+
+    has_core_content = (
+        "skills" in sections
+        and (
+            "projects" in sections
+            or "experience" in sections
+            or "internship" in sections
         )
+    )
 
-    if "Internship" in sections:
-        strengths.append(
-            "Internship experience is included."
-        )
+    weak_content_signals = 0
 
-    if len(metrics) > 0:
-        strengths.append(
-            "Resume contains measurable information."
-        )
+    if word_count < 220:
+        weak_content_signals += 1
 
-    if email_found:
-        strengths.append(
-            "Email address detected."
-        )
+    if not metrics:
+        weak_content_signals += 1
 
-    if linkedin_found:
-        strengths.append(
-            "LinkedIn profile detected."
-        )
+    if not action_verbs:
+        weak_content_signals += 1
 
-    if github_found:
-        strengths.append(
-            "GitHub profile detected."
-        )
-
-    if not strengths:
-        strengths.append(
-            "Resume contains identifiable resume content."
-        )
-
-    # =========================
-    # SUGGESTIONS
-    # =========================
-
-    suggestions = []
-
-    if "Summary" not in sections:
-
-        suggestions.append(
-            "Consider adding a concise professional summary tailored to your target role."
-        )
-
-    if "Projects" not in sections:
-
-        suggestions.append(
-            "Add relevant projects and clearly explain your contribution and technologies used."
-        )
-
-    if (
-        "Experience" not in sections
-        and "Internship" not in sections
-    ):
-
-        suggestions.append(
-            "If you have relevant experience or internships, include them with specific responsibilities and genuine results."
-        )
-
-    if "Certifications" not in sections:
-
-        suggestions.append(
-            "If you have relevant certifications, consider adding a Certifications section. Choose certifications related to your target role."
-        )
-
-    if len(metrics) == 0:
-
-        suggestions.append(
-            "Add genuine numbers or measurable outcomes to project or experience bullets where available."
-        )
-
-    if len(action_verbs) < 3:
-
-        suggestions.append(
-            "Use stronger action verbs such as developed, implemented, analyzed, or optimized where truthful."
-        )
+    if detect_generic_phrases(text):
+        weak_content_signals += 1
 
     if len(skills) < 3:
+        weak_content_signals += 1
 
-        suggestions.append(
-            "Make relevant technical skills easier to identify for recruiters and ATS systems."
-        )
+    if not has_core_content:
+        weak_content_signals += 2
 
-    if not linkedin_found:
+    if meaningful_lines < 12:
+        weak_content_signals += 2
 
-        suggestions.append(
-            "Consider adding your LinkedIn profile if you have one."
-        )
+    if weak_content_signals >= 5:
+        score = min(score, 49)
+    elif weak_content_signals == 4:
+        score = min(score, 59)
+    elif weak_content_signals == 3:
+        score = min(score, 69)
+    elif weak_content_signals == 2:
+        score = min(score, 79)
+
+    missing_core = 0
+
+    if "summary" not in sections:
+        missing_core += 1
+
+    if "education" not in sections:
+        missing_core += 1
+
+    if "skills" not in sections:
+        missing_core += 1
 
     if (
-        not github_found
-        and len(skills) > 0
+        "projects" not in sections
+        and "experience" not in sections
+        and "internship" not in sections
     ):
+        missing_core += 2
 
-        suggestions.append(
-            "If you have relevant code projects, consider adding your GitHub profile."
+    if missing_core >= 4:
+        score = min(score, 49)
+    elif missing_core == 3:
+        score = min(score, 59)
+    elif missing_core == 2:
+        score = min(score, 69)
+
+    if word_count < 150:
+        score = min(score, 39)
+    elif word_count < 220:
+        score = min(score, 54)
+
+    bullets = extract_bullets(text)
+
+    if (
+        ("projects" in sections or "experience" in sections)
+        and len(bullets) == 0
+    ):
+        score = min(score, 59)
+
+    score = int(
+        max(
+            0,
+            min(
+                round(score),
+                100,
+            ),
+        )
+    )
+
+    if score >= 90:
+        verdict = "Excellent Resume"
+        verdict_emoji = "🔥"
+        verdict_message = (
+            "Your resume is highly competitive and demonstrates strong evidence, clarity and professional impact."
         )
 
+    elif score >= 80:
+        verdict = "Strong Resume"
+        verdict_emoji = "😎"
+        verdict_message = (
+            "Your resume has a strong foundation, with a few areas that can still be improved."
+        )
+
+    elif score >= 70:
+        verdict = "Good Resume"
+        verdict_emoji = "🙂"
+        verdict_message = (
+            "Your resume has good foundations, but several improvements could make it more competitive."
+        )
+
+    elif score >= 60:
+        verdict = "Needs Improvement"
+        verdict_emoji = "😐"
+        verdict_message = (
+            "Your resume has useful content, but important areas need improvement before applying."
+        )
+
+    elif score >= 40:
+        verdict = "Weak Resume"
+        verdict_emoji = "😕"
+        verdict_message = (
+            "Your resume needs significant improvement in content quality, evidence and presentation."
+        )
+
+    else:
+        verdict = "Major Improvement Needed"
+        verdict_emoji = "😟"
+        verdict_message = (
+            "Your resume currently lacks enough strong professional evidence and needs substantial improvement."
+        )
+
+    strengths = (
+        contact_strengths
+        + summary_strengths
+        + education_strengths
+        + skills_strengths
+        + project_strengths
+        + experience_strengths
+        + impact_strengths
+        + ats_strengths
+    )
+
+    suggestions = (
+        contact_suggestions
+        + summary_suggestions
+        + education_suggestions
+        + skills_suggestions
+        + project_suggestions
+        + experience_suggestions
+        + impact_suggestions
+        + ats_suggestions
+    )
+
+    suggestions = list(
+        dict.fromkeys(suggestions)
+    )
+
+    strengths = list(
+        dict.fromkeys(strengths)
+    )
+
+    why_score = []
+
+    if contact_score >= 8:
+        why_score.append(
+            "Contact information is mostly complete."
+        )
+    elif contact_score < 5:
+        why_score.append(
+            "Contact information is incomplete."
+        )
+
+    if summary_score >= 8:
+        why_score.append(
+            "The professional summary is focused and relevant."
+        )
+    elif summary_score < 5:
+        why_score.append(
+            "The professional summary is weak or too generic."
+        )
+
+    if skills_score >= 8:
+        why_score.append(
+            "The Skills section contains a useful set of technical skills."
+        )
+    elif skills_score < 5:
+        why_score.append(
+            "The Skills section needs stronger or more relevant evidence."
+        )
+
+    if project_score >= 10:
+        why_score.append(
+            "Projects provide meaningful technical evidence."
+        )
+    elif "projects" in sections and project_score < 7:
+        why_score.append(
+            "Project descriptions need stronger implementation and outcome details."
+        )
+
+    if experience_score >= 10:
+        why_score.append(
+            "Experience demonstrates useful professional evidence."
+        )
+    elif (
+        "experience" in sections
+        or "internship" in sections
+    ):
+        why_score.append(
+            "Experience descriptions need stronger achievement-focused bullets."
+        )
+
+    if metrics:
+        why_score.append(
+            "The resume uses measurable evidence."
+        )
+    else:
+        why_score.append(
+            "The resume has limited measurable evidence."
+        )
+
+    if detect_generic_phrases(text):
+        why_score.append(
+            "Some generic resume language reduces the content quality."
+        )
+
+    if not action_verbs:
+        why_score.append(
+            "Bullet points need stronger action-oriented language."
+        )
+
+    if word_count < 220:
+        why_score.append(
+            "The resume contains relatively little professional evidence."
+        )
+
+    breakdown = {
+        "contact": contact_score,
+        "summary": summary_score,
+        "education": education_score,
+        "skills": skills_score,
+        "projects": project_score,
+        "experience": experience_score + experience_presence_bonus,
+        "impact": impact_score,
+        "ats": ats_score,
+        "certifications": certification_bonus,
+        "achievements": achievement_bonus,
+        "metrics": min(len(metrics), 10),
+        "action_verbs": min(len(action_verbs), 10),
+        "links": (
+            int("linkedin.com" in text.lower())
+            + int("github.com" in text.lower())
+        ),
+        "internship": (
+            5
+            if "internship" in sections
+            else 0
+        ),
+    }
+
     return {
+        "success": True,
 
         "score": score,
+
+        "overall": verdict,
+        "verdict": verdict,
+        "verdict_emoji": verdict_emoji,
+        "verdict_message": verdict_message,
+
+        "why_score": why_score[:8],
 
         "breakdown": breakdown,
 
         "detected_sections": sections,
+        "sections": sections,
 
-        "skills_detected": len(skills),
-
+        "skills_detected": skills,
         "skills": skills,
 
-        "strengths": strengths,
+        "strengths": strengths[:12],
 
-        "suggestions": suggestions,
+        "suggestions": suggestions[:12],
+
+        "action_plan": suggestions[:6],
 
         "metrics_found": metrics,
+        "action_verbs_found": action_verbs,
 
-        "action_verbs_found": action_verbs
+        "generic_phrases_found": detect_generic_phrases(text),
+        "weak_bullet_phrases": detect_weak_bullets(text),
+
+        "word_count": word_count,
+        "bullet_count": len(bullets),
+        "meaningful_lines": meaningful_lines,
     }
 
 
-# =========================
-# GEMINI AI FEEDBACK
-# =========================
+# =========================================================
+# GEMINI HELPERS
+# =========================================================
 
-def generate_ai_feedback(resume_text):
+def is_transient_gemini_error(exc: Exception) -> bool:
+    message = str(exc).lower()
 
-    if gemini_client is None:
+    transient_terms = [
+        "503",
+        "500",
+        "429",
+        "unavailable",
+        "service unavailable",
+        "temporarily unavailable",
+        "internal server error",
+        "resource exhausted",
+        "deadline exceeded",
+    ]
 
-        return (
-            "AI feedback is unavailable because the Gemini API key "
-            "is not configured."
+    return any(
+        term in message
+        for term in transient_terms
+    )
+
+
+def gemini_generate(
+    prompt: str,
+    *,
+    response_schema=None,
+    temperature: float = 0.2,
+):
+    if not gemini_client:
+        raise RuntimeError(
+            "Gemini API key is not configured."
         )
 
-    # Keep AI prompt reasonably small for faster response.
-    # Rule-based analysis still uses the complete text.
-    resume_for_ai = resume_text[:12000]
+    models = [
+        "gemini-3.7-flash",
+        "gemini-3.5-flash-lite",
+    ]
+
+    last_error = None
+
+    for model_index, model_name in enumerate(models):
+
+        for attempt in range(3):
+
+            try:
+
+                config_kwargs = {
+                    "temperature": temperature,
+                }
+
+                if response_schema is not None:
+                    config_kwargs.update({
+                        "response_mime_type": "application/json",
+                        "response_schema": response_schema,
+                    })
+
+                response = gemini_client.models.generate_content(
+                    model=model_name,
+                    contents=prompt,
+                    config=types.GenerateContentConfig(
+                        **config_kwargs
+                    ),
+                )
+
+                return response
+
+            except Exception as exc:
+
+                last_error = exc
+
+                print(
+                    f"Gemini error using {model_name}, attempt {attempt + 1}:",
+                    repr(exc),
+                )
+
+                if not is_transient_gemini_error(exc):
+                    break
+
+                if attempt < 2:
+                    time_to_wait = 2 ** attempt
+                    time_to_wait = min(
+                        time_to_wait,
+                        6,
+                    )
+
+                    import time
+
+                    time.sleep(time_to_wait)
+
+        print(
+            f"Gemini model {model_name} exhausted."
+        )
+
+        if model_index < len(models) - 1:
+            continue
+
+    raise RuntimeError(
+        str(last_error)
+        if last_error
+        else "Gemini request failed."
+    )
+
+
+# =========================================================
+# GEMINI AI ADVISOR
+# =========================================================
+
+def generate_ai_feedback(
+    resume_text: str,
+) -> dict[str, Any]:
+
+    if not gemini_client:
+        return {
+            "success": False,
+            "message": "Gemini API key is not configured.",
+        }
 
     prompt = f"""
-You are an expert resume and career advisor.
+You are ResumeAI's expert AI Resume Advisor.
 
-Analyze the resume below.
+Analyze ONLY the resume text provided below.
 
-IMPORTANT RULES:
+Give honest, evidence-based feedback.
 
-- Give honest and specific feedback.
-- Use ONLY information present in the resume.
-- Never invent skills, achievements, experience, numbers, technologies, employers, or results.
-- Never recommend fake achievements.
-- If a certification, skill, project, or extra section could help, explain that it should be added ONLY if it is genuinely relevant and the candidate actually has it or can legitimately earn it.
-- Do not claim that a candidate has a certification or skill unless it appears in the resume.
-- Identify actual weaknesses from the provided resume.
-- Keep the advice useful for a student or job applicant.
-
-Give your response in this structure:
-
-OVERALL ASSESSMENT
-
-HIGH PRIORITY IMPROVEMENTS
-
-MEDIUM PRIORITY IMPROVEMENTS
-
-STRENGTHS
-
-SPECIFIC WRITING IMPROVEMENTS
-
-CERTIFICATION / EXTRA SKILL SUGGESTIONS
-
-FINAL CAREER ADVICE
+STRICT RULES:
+- Never invent facts.
+- Never assume skills.
+- Never invent employers.
+- Never invent education.
+- Never invent certifications.
+- Never invent achievements.
+- Never invent numbers.
+- Never claim the resume contains something that is not visible.
+- If something is missing, explicitly identify it as missing.
+- Recommendations may suggest what the candidate should add.
+- Do not give fake praise.
+- Do not call a weak resume excellent.
+- Be specific and practical.
+- Prioritize the most important problems.
+- Evaluate clarity, ATS readability, projects, experience,
+  measurable impact, summary quality, technical evidence
+  and overall job-readiness.
+- Do not calculate or invent a resume score.
+- The rule-based analyzer calculates the score separately.
 
 RESUME:
-{resume_for_ai}
+----------------
+{resume_text[:30000]}
+----------------
 """
 
     try:
 
-        response = gemini_client.models.generate_content(
-            model="gemini-3.5-flash-lite",
-            contents=prompt
+        response = gemini_generate(
+            prompt,
+            response_schema=FeedbackSchema,
+            temperature=0.2,
         )
 
-        if response.text:
-            return response.text
-
-        return (
-            "AI feedback was not generated."
+        data = json.loads(
+            response.text
         )
 
-    except Exception as e:
+        return {
+            "success": True,
+            "overall_advice": data.get(
+                "overall_advice",
+                "",
+            ),
+            "high_priority_issues": data.get(
+                "high_priority_issues",
+                [],
+            ),
+            "medium_priority_issues": data.get(
+                "medium_priority_issues",
+                [],
+            ),
+            "strengths": data.get(
+                "strengths",
+                [],
+            ),
+            "actionable_suggestions": data.get(
+                "actionable_suggestions",
+                [],
+            ),
+        }
+
+    except Exception as exc:
 
         print(
-            "Gemini error:",
-            e
+            "Gemini feedback error:",
+            repr(exc),
         )
 
-        return (
-            "AI feedback is temporarily unavailable. "
-            "The rule-based resume analysis is still available."
+        return {
+            "success": False,
+            "message": str(exc),
+        }
+
+
+def run_ai_feedback_job(
+    job_id: str,
+    resume_text: str,
+):
+
+    ai_jobs[job_id]["status"] = "processing"
+
+    try:
+
+        feedback = generate_ai_feedback(
+            resume_text
         )
 
+        if not feedback.get("success"):
 
-# =========================
-# HOME
-# =========================
+            ai_jobs[job_id]["status"] = "failed"
+
+            ai_jobs[job_id]["message"] = feedback.get(
+                "message",
+                "AI feedback failed.",
+            )
+
+            return
+
+        ai_jobs[job_id]["status"] = "completed"
+
+        ai_jobs[job_id]["ai_feedback"] = feedback
+
+    except Exception as exc:
+
+        ai_jobs[job_id]["status"] = "failed"
+
+        ai_jobs[job_id]["message"] = str(exc)
+
+
+# =========================================================
+# AI CHAT
+# =========================================================
+
+def generate_chat_answer(
+    resume_text: str,
+    message: str,
+) -> str:
+
+    if not gemini_client:
+        raise RuntimeError(
+            "Gemini API key is not configured."
+        )
+
+    prompt = f"""
+You are ResumeAI Career Chat.
+
+Help a student or job seeker understand and improve their resume.
+
+The user can communicate in:
+English, Hindi or Hinglish.
+
+LANGUAGE RULE:
+Reply naturally in the same language style used by the user.
+
+Use ONLY information found in the resume.
+
+Never invent:
+- skills
+- projects
+- employers
+- education
+- certifications
+- achievements
+- numbers
+- experience
+
+If something is not present, clearly say that it is not present.
+
+You may recommend what the user should add.
+
+Give practical, specific answers.
+
+RESUME:
+----------------
+{resume_text[:30000]}
+----------------
+
+USER QUESTION:
+{message}
+"""
+
+    response = gemini_generate(
+        prompt,
+        temperature=0.3,
+    )
+
+    answer = response.text.strip()
+
+    if not answer:
+        raise RuntimeError(
+            "Gemini returned an empty response."
+        )
+
+    return answer
+
+
+def run_chatbot_job(
+    chat_job_id: str,
+    resume_text: str,
+    message: str,
+):
+
+    chat_jobs[chat_job_id]["status"] = "processing"
+
+    try:
+
+        answer = generate_chat_answer(
+            resume_text,
+            message,
+        )
+
+        chat_jobs[chat_job_id]["status"] = "completed"
+
+        chat_jobs[chat_job_id]["chat_answer"] = answer
+
+    except Exception as exc:
+
+        print(
+            "Chat error:",
+            repr(exc),
+        )
+
+        chat_jobs[chat_job_id]["status"] = "failed"
+
+        chat_jobs[chat_job_id]["message"] = str(exc)
+
+
+# =========================================================
+# AI RESUME ENHANCER
+# =========================================================
+
+def generate_enhanced_resume(
+    resume_text: str,
+) -> str:
+
+    if not gemini_client:
+        raise RuntimeError(
+            "Gemini API key is not configured."
+        )
+
+    prompt = f"""
+You are ResumeAI's professional Resume Enhancer.
+
+Rewrite the resume below into a stronger, clean, professional,
+ATS-friendly version.
+
+CRITICAL FACT-PRESERVATION RULES:
+
+1. Use ONLY facts contained in the original resume.
+2. NEVER invent a company.
+3. NEVER invent a job title.
+4. NEVER invent education.
+5. NEVER invent skills.
+6. NEVER invent projects.
+7. NEVER invent certifications.
+8. NEVER invent achievements.
+9. NEVER invent metrics, percentages or numbers.
+10. NEVER invent dates.
+11. NEVER invent responsibilities.
+12. NEVER invent technologies.
+13. NEVER claim experience that is not present.
+14. Do not exaggerate the candidate's experience.
+15. You may improve grammar, wording, structure and clarity.
+16. You may convert weak wording into stronger professional wording
+    ONLY when the underlying fact remains exactly the same.
+17. Keep all genuine information from the original resume.
+18. If information is missing, do not create it.
+19. Make the resume concise and ATS-friendly.
+20. Use professional section headings.
+21. Use bullet points where appropriate.
+22. Do not add explanations outside the resume.
+23. Return ONLY the enhanced resume.
+
+ORIGINAL RESUME:
+==================================================
+{resume_text[:30000]}
+==================================================
+"""
+
+    response = gemini_generate(
+        prompt,
+        temperature=0.2,
+    )
+
+    enhanced = response.text.strip()
+
+    if not enhanced:
+        raise RuntimeError(
+            "Gemini returned an empty enhanced resume."
+        )
+
+    return enhanced
+
+
+# =========================================================
+# ROUTES
+# =========================================================
 
 @app.get("/")
-def home():
-
+def root():
     return {
-        "message":
-        "AI Resume Analyzer Backend is running!"
+        "success": True,
+        "message": "AI Resume Analyzer Backend is running!",
     }
 
 
-# =========================
-# ANALYZE RESUME
-# =========================
-
 @app.post("/analyze")
 async def analyze_resume(
-    file: UploadFile = File(...)
+    background_tasks: BackgroundTasks,
+    file: UploadFile = File(...),
 ):
 
-    filename = (
-        file.filename or ""
-    ).lower()
+    filename = file.filename or ""
 
-    # -------------------------
-    # Supported file types
-    # -------------------------
-
-    supported_extensions = (
+    allowed = {
         ".pdf",
         ".docx",
         ".jpg",
         ".jpeg",
-        ".png"
-    )
+        ".png",
+    }
 
-    if not filename.endswith(
-        supported_extensions
-    ):
+    extension = os.path.splitext(
+        filename
+    )[1].lower()
 
+    if extension not in allowed:
         return {
             "success": False,
-            "message":
-            "Please upload a PDF, DOCX, JPG, JPEG, or PNG resume."
+            "message": (
+                "Only PDF, DOCX, JPG and PNG resume files are supported."
+            ),
         }
-
-    file_bytes = await file.read()
-
-    if not file_bytes:
-
-        return {
-            "success": False,
-            "message":
-            "The uploaded file is empty."
-        }
-
-    # -------------------------
-    # Extract text
-    # -------------------------
 
     try:
 
-        if filename.endswith(".pdf"):
+        data = await file.read()
 
-            text = extract_pdf_text(
-                file_bytes
-            )
+        if not data:
+            return {
+                "success": False,
+                "message": "The uploaded file is empty.",
+            }
 
-        elif filename.endswith(".docx"):
+        text = await extract_resume_text(
+            filename,
+            data,
+        )
 
-            text = extract_docx_text(
-                file_bytes
-            )
+        if len(text.strip()) < 80:
+            return {
+                "success": False,
+                "message": (
+                    "Could not extract enough text. Please upload a clear resume."
+                ),
+            }
 
-        else:
+        if not looks_like_resume(text):
+            return {
+                "success": False,
+                "message": (
+                    "This does not appear to be a resume. Please upload a genuine resume."
+                ),
+            }
 
-            text = extract_image_text(
-                file_bytes
-            )
+        analysis = analyze_resume_text(text)
 
-    except Exception as e:
+        job_id = str(uuid.uuid4())
+
+        ai_jobs[job_id] = {
+            "status": "queued",
+            "ai_feedback": None,
+            "resume_text": text,
+        }
+
+        background_tasks.add_task(
+            run_ai_feedback_job,
+            job_id,
+            text,
+        )
+
+        return {
+            **analysis,
+
+            "filename": filename,
+
+            "ai_feedback": None,
+            "ai_feedback_status": "processing",
+
+            "ai_feedback_job_id": job_id,
+            "resume_job_id": job_id,
+            "job_id": job_id,
+        }
+
+    except ValueError as exc:
+
+        return {
+            "success": False,
+            "message": str(exc),
+        }
+
+    except Exception as exc:
 
         print(
-            "Document reading error:",
-            e
+            "Analyze error:",
+            repr(exc),
         )
 
         return {
             "success": False,
-            "message":
-            "Could not read this document. Please upload a clear, readable resume."
+            "message": (
+                "Resume processing failed. Please try again."
+            ),
         }
 
-    text = text.strip()
 
-    # -------------------------
-    # Empty / unreadable check
-    # -------------------------
+@app.get("/ai-feedback/{job_id}")
+def get_ai_feedback(job_id: str):
 
-    if len(text) < 50:
+    job = ai_jobs.get(job_id)
 
+    if not job:
         return {
             "success": False,
-            "message":
-            "Could not read enough text from this document. Please upload a clearer resume."
+            "status": "failed",
+            "message": "AI feedback job not found.",
         }
-
-    if not text_quality_is_reasonable(text):
-
-        return {
-            "success": False,
-            "message":
-            "The document text could not be read clearly enough. Please upload a clearer resume."
-        }
-
-    # -------------------------
-    # Resume validation
-    # -------------------------
-
-    if not looks_like_resume(text):
-
-        return {
-            "success": False,
-            "message":
-            "This document does not appear to be a resume. Please upload a valid resume."
-        }
-
-    # -------------------------
-    # Rule-based analysis
-    # -------------------------
-
-    analysis = analyze_resume_text(
-        text
-    )
-
-    # -------------------------
-    # Gemini AI Advisor
-    # -------------------------
-
-    ai_feedback = generate_ai_feedback(
-        text
-    )
-
-    # -------------------------
-    # Final response
-    # -------------------------
 
     return {
-
         "success": True,
-
-        "message":
-        "Resume successfully analyzed.",
-
-        "score":
-        analysis["score"],
-
-        "breakdown":
-        analysis["breakdown"],
-
-        "detected_sections":
-        analysis["detected_sections"],
-
-        "skills_detected":
-        analysis["skills_detected"],
-
-        "skills":
-        analysis["skills"],
-
-        "strengths":
-        analysis["strengths"],
-
-        "suggestions":
-        analysis["suggestions"],
-
-        "metrics_found":
-        analysis["metrics_found"],
-
-        "action_verbs_found":
-        analysis["action_verbs_found"],
-
-        "ai_feedback":
-        ai_feedback,
-
-        "text_preview":
-        text[:500]
+        "status": job.get("status"),
+        "ai_feedback": job.get("ai_feedback"),
+        "message": job.get("message"),
     }
+
+
+@app.post("/chat")
+async def start_chat(
+    request: ChatRequest,
+):
+
+    resume_job_id = request.job_id
+
+    job = ai_jobs.get(resume_job_id)
+
+    if not job:
+        return {
+            "success": False,
+            "message": (
+                "Resume analysis not found. Please analyze the resume again."
+            ),
+        }
+
+    resume_text = job.get("resume_text")
+
+    if not resume_text:
+        return {
+            "success": False,
+            "message": (
+                "Resume text is unavailable. Please analyze the resume again."
+            ),
+        }
+
+    chat_job_id = str(uuid.uuid4())
+
+    chat_jobs[chat_job_id] = {
+        "status": "queued",
+        "chat_answer": None,
+        "message": None,
+    }
+
+    asyncio.create_task(
+        asyncio.to_thread(
+            run_chatbot_job,
+            chat_job_id,
+            resume_text,
+            request.message.strip(),
+        )
+    )
+
+    return {
+        "success": True,
+        "chat_job_id": chat_job_id,
+        "status": "queued",
+    }
+
+
+@app.get("/chat/{chat_job_id}")
+def get_chat(chat_job_id: str):
+
+    job = chat_jobs.get(chat_job_id)
+
+    if not job:
+        return {
+            "success": False,
+            "status": "failed",
+            "message": "Chat job not found.",
+        }
+
+    answer = job.get("chat_answer")
+
+    return {
+        "success": True,
+        "status": job.get("status"),
+        "answer": answer,
+        "chat_answer": answer,
+        "message": job.get("message"),
+    }
+
+
+# =========================================================
+# PROFESSIONAL PDF RESUME ENHANCER
+# =========================================================
+
+import base64
+from reportlab.lib import colors
+from reportlab.lib.enums import TA_CENTER, TA_LEFT
+from reportlab.lib.pagesizes import A4
+from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
+from reportlab.lib.units import inch
+from reportlab.platypus import (
+    SimpleDocTemplate,
+    Paragraph,
+    Spacer,
+    HRFlowable,
+    Image as ReportLabImage,
+    KeepTogether,
+)
+from reportlab.lib.utils import ImageReader
+
+
+# ---------------------------------------------------------
+# AI ENHANCEMENT
+# ---------------------------------------------------------
+
+def generate_professional_resume_text(
+    resume_text: str,
+) -> str:
+
+    if not gemini_client:
+        raise RuntimeError(
+            "Gemini API key is not configured."
+        )
+
+    prompt = f"""
+You are ResumeAI's professional resume editor.
+
+Rewrite the ORIGINAL RESUME into a polished, professional,
+ATS-friendly resume.
+
+VERY IMPORTANT:
+
+Use ONLY facts contained in the original resume.
+
+NEVER invent:
+- companies
+- job titles
+- skills
+- technologies
+- projects
+- certifications
+- achievements
+- numbers
+- percentages
+- dates
+- responsibilities
+- employers
+- education
+- experience
+
+You ARE allowed to:
+- fix grammar
+- improve sentence structure
+- remove unnecessary repetition
+- make wording professional
+- convert weak bullet wording into stronger wording
+  when the underlying fact remains unchanged
+- organize information into professional sections
+- improve readability
+- make bullets concise
+- preserve all genuine facts
+
+If a result/number is not present, DO NOT create one.
+
+Preserve genuine email, phone, LinkedIn and GitHub details.
+
+Use these standard section headings whenever the information exists:
+
+PROFESSIONAL SUMMARY
+SKILLS
+EXPERIENCE
+INTERNSHIP
+PROJECTS
+EDUCATION
+CERTIFICATIONS
+ACHIEVEMENTS
+
+Do not add a fake section merely because it sounds professional.
+
+Every important factual item from the original resume must remain
+somewhere in the enhanced resume.
+
+Return ONLY the resume text.
+
+ORIGINAL RESUME
+==================================================
+{resume_text[:30000]}
+==================================================
+"""
+
+    response = gemini_generate(
+        prompt,
+        temperature=0.2,
+    )
+
+    enhanced = response.text.strip()
+
+    if not enhanced:
+        raise RuntimeError(
+            "Gemini returned an empty enhanced resume."
+        )
+
+    return enhanced
+
+
+# ---------------------------------------------------------
+# TEXT HELPERS
+# ---------------------------------------------------------
+
+PDF_SECTION_NAMES = {
+    "professional summary",
+    "summary",
+    "profile",
+    "objective",
+    "skills",
+    "technical skills",
+    "experience",
+    "work experience",
+    "professional experience",
+    "internship",
+    "internships",
+    "projects",
+    "education",
+    "certifications",
+    "certification",
+    "achievements",
+    "awards",
+    "honors",
+}
+
+
+def is_pdf_section_heading(line: str) -> bool:
+
+    cleaned = re.sub(
+        r"[^a-zA-Z ]",
+        "",
+        line,
+    ).strip().lower()
+
+    return (
+        cleaned in PDF_SECTION_NAMES
+        or cleaned.upper() == cleaned
+        and len(cleaned.split()) <= 5
+    )
+
+
+def clean_resume_for_pdf(text: str) -> str:
+
+    text = text.replace("\r\n", "\n")
+    text = text.replace("\r", "\n")
+
+    lines = []
+
+    for raw_line in text.split("\n"):
+
+        line = re.sub(
+            r"[ \t]+",
+            " ",
+            raw_line,
+        ).strip()
+
+        if not line:
+            if lines and lines[-1] != "":
+                lines.append("")
+
+            continue
+
+        lines.append(line)
+
+    while lines and lines[-1] == "":
+        lines.pop()
+
+    return "\n".join(lines)
+
+
+def split_resume_lines(text: str) -> list[str]:
+
+    cleaned = clean_resume_for_pdf(text)
+
+    return cleaned.split("\n")
+
+
+def escape_pdf_text(text: str) -> str:
+
+    return (
+        text.replace("&", "&amp;")
+        .replace("<", "&lt;")
+        .replace(">", "&gt;")
+    )
+
+
+def is_bullet_line(line: str) -> bool:
+
+    return bool(
+        re.match(
+            r"^(?:[•●▪◦‣*-]|\d+[.)])\s+",
+            line.strip(),
+        )
+    )
+
+
+def remove_bullet_marker(line: str) -> str:
+
+    return re.sub(
+        r"^(?:[•●▪◦‣*-]|\d+[.)])\s+",
+        "",
+        line.strip(),
+    )
+
+
+# ---------------------------------------------------------
+# PHOTO PROCESSING - PRESERVE ORIGINAL PHOTO
+# ---------------------------------------------------------
+
+def prepare_profile_photo(photo_data: bytes) -> io.BytesIO:
+    """
+    Preserve the complete photo.
+    No square crop.
+    Aspect ratio is maintained.
+    """
+
+    image = Image.open(
+        io.BytesIO(photo_data)
+    )
+
+    # Correct camera orientation without cropping.
+    try:
+        from PIL import ImageOps
+        image = ImageOps.exif_transpose(image)
+    except Exception:
+        pass
+
+    image = image.convert("RGB")
+
+    # Resize only if extremely large.
+    # Aspect ratio is always preserved.
+    max_dimension = 1200
+
+    if max(image.size) > max_dimension:
+        ratio = max_dimension / max(image.size)
+
+        new_size = (
+            max(1, int(image.width * ratio)),
+            max(1, int(image.height * ratio)),
+        )
+
+        image = image.resize(
+            new_size,
+            Image.LANCZOS,
+        )
+
+    output = io.BytesIO()
+
+    image.save(
+        output,
+        format="JPEG",
+        quality=94,
+    )
+
+    output.seek(0)
+
+    return output
+
+
+# ---------------------------------------------------------
+# EXTRACT ORIGINAL PHOTO FROM PDF
+# ---------------------------------------------------------
+
+def extract_profile_photo_from_pdf(
+    data: bytes,
+) -> bytes | None:
+
+    try:
+
+        doc = fitz.open(
+            stream=data,
+            filetype="pdf",
+        )
+
+        candidates = []
+
+        for page_number, page in enumerate(doc):
+
+            images = page.get_images(
+                full=True
+            )
+
+            for image_info in images:
+
+                xref = image_info[0]
+
+                try:
+
+                    extracted = doc.extract_image(
+                        xref
+                    )
+
+                    image_bytes = extracted.get(
+                        "image"
+                    )
+
+                    if not image_bytes:
+                        continue
+
+                    image = Image.open(
+                        io.BytesIO(image_bytes)
+                    )
+
+                    width, height = image.size
+
+                    if width < 100 or height < 100:
+                        continue
+
+                    aspect = width / height
+
+                    # Ignore extremely wide/tiny banner images.
+                    if aspect < 0.45 or aspect > 1.8:
+                        continue
+
+                    area = width * height
+
+                    # Profile-photo-like images are generally
+                    # reasonably large and portrait/square.
+                    score = 0
+
+                    if 0.55 <= aspect <= 1.35:
+                        score += 5
+
+                    if page_number == 0:
+                        score += 3
+
+                    if area >= 40000:
+                        score += 2
+
+                    candidates.append(
+                        (
+                            score,
+                            page_number,
+                            image_bytes,
+                        )
+                    )
+
+                except Exception:
+                    continue
+
+        doc.close()
+
+        if not candidates:
+            return None
+
+        candidates.sort(
+            key=lambda item: (
+                item[0],
+                -item[1],
+            ),
+            reverse=True,
+        )
+
+        return candidates[0][2]
+
+    except Exception as exc:
+
+        print(
+            "PDF photo extraction error:",
+            repr(exc),
+        )
+
+        return None
+
+
+# ---------------------------------------------------------
+# EXTRACT ORIGINAL PHOTO FROM DOCX
+# ---------------------------------------------------------
+
+def extract_profile_photo_from_docx(
+    data: bytes,
+) -> bytes | None:
+
+    try:
+
+        document = Document(
+            io.BytesIO(data)
+        )
+
+        candidates = []
+
+        # First inspect inline shapes because these are
+        # usually actual visible document images.
+        for shape in document.inline_shapes:
+
+            try:
+
+                blip = (
+                    shape
+                    ._inline
+                    .graphic
+                    .graphicData
+                    .pic
+                    .blipFill
+                    .blip
+                )
+
+                relationship_id = blip.embed
+
+                related_part = (
+                    document.part
+                    .related_parts
+                    .get(relationship_id)
+                )
+
+                if not related_part:
+                    continue
+
+                image_bytes = related_part.blob
+
+                image = Image.open(
+                    io.BytesIO(image_bytes)
+                )
+
+                width, height = image.size
+
+                if width < 100 or height < 100:
+                    continue
+
+                aspect = width / height
+
+                if aspect < 0.45 or aspect > 1.8:
+                    continue
+
+                area = width * height
+
+                score = 5
+
+                if 0.55 <= aspect <= 1.35:
+                    score += 4
+
+                if area >= 40000:
+                    score += 2
+
+                candidates.append(
+                    (
+                        score,
+                        image_bytes,
+                    )
+                )
+
+            except Exception:
+                continue
+
+        # Fallback: inspect all image relationships.
+        if not candidates:
+
+            for relationship in (
+                document.part.rels.values()
+            ):
+
+                try:
+
+                    if "image" not in relationship.reltype.lower():
+                        continue
+
+                    related_part = relationship.target_part
+
+                    image_bytes = related_part.blob
+
+                    image = Image.open(
+                        io.BytesIO(image_bytes)
+                    )
+
+                    width, height = image.size
+
+                    if width < 100 or height < 100:
+                        continue
+
+                    aspect = width / height
+
+                    if aspect < 0.45 or aspect > 1.8:
+                        continue
+
+                    score = 5
+
+                    if 0.55 <= aspect <= 1.35:
+                        score += 4
+
+                    candidates.append(
+                        (
+                            score,
+                            image_bytes,
+                        )
+                    )
+
+                except Exception:
+                    continue
+
+        if not candidates:
+            return None
+
+        candidates.sort(
+            key=lambda item: item[0],
+            reverse=True,
+        )
+
+        return candidates[0][1]
+
+    except Exception as exc:
+
+        print(
+            "DOCX photo extraction error:",
+            repr(exc),
+        )
+
+        return None
+
+
+# ---------------------------------------------------------
+# EXTRACT ORIGINAL RESUME PHOTO
+# ---------------------------------------------------------
+
+def extract_embedded_profile_photo(
+    filename: str,
+    data: bytes,
+) -> bytes | None:
+
+    extension = os.path.splitext(
+        filename
+    )[1].lower()
+
+    if extension == ".pdf":
+
+        return extract_profile_photo_from_pdf(
+            data
+        )
+
+    if extension == ".docx":
+
+        return extract_profile_photo_from_docx(
+            data
+        )
+
+    # JPG/PNG resume files are themselves images.
+    # We do not treat the entire resume image as a
+    # profile-photo extraction source.
+    return None
+
+
+# ---------------------------------------------------------
+# VALIDATE USER PHOTO
+# ---------------------------------------------------------
+
+def validate_uploaded_photo(
+    photo_data: bytes,
+) -> bytes | None:
+
+    if not photo_data:
+        return None
+
+    if len(photo_data) > 8 * 1024 * 1024:
+        return None
+
+    try:
+
+        image = Image.open(
+            io.BytesIO(photo_data)
+        )
+
+        image.verify()
+
+        # Open again after verify().
+        image = Image.open(
+            io.BytesIO(photo_data)
+        )
+
+        if image.width < 80 or image.height < 80:
+            return None
+
+        return photo_data
+
+    except Exception:
+
+        return None
+
+
+# ---------------------------------------------------------
+# TEXT HELPERS
+# ---------------------------------------------------------
+
+PDF_SECTION_NAMES = {
+    "professional summary",
+    "summary",
+    "profile",
+    "objective",
+    "skills",
+    "technical skills",
+    "experience",
+    "work experience",
+    "professional experience",
+    "internship",
+    "internships",
+    "projects",
+    "education",
+    "certifications",
+    "certification",
+    "achievements",
+    "awards",
+    "honors",
+}
+
+
+def is_pdf_section_heading(
+    line: str,
+) -> bool:
+
+    cleaned = re.sub(
+        r"[^a-zA-Z ]",
+        "",
+        line,
+    ).strip().lower()
+
+    return (
+        cleaned in PDF_SECTION_NAMES
+        or (
+            cleaned.upper() == cleaned
+            and len(cleaned.split()) <= 5
+        )
+    )
+
+
+def clean_resume_for_pdf(
+    text: str,
+) -> str:
+
+    text = text.replace(
+        "\r\n",
+        "\n",
+    )
+
+    text = text.replace(
+        "\r",
+        "\n",
+    )
+
+    lines = []
+
+    for raw_line in text.split("\n"):
+
+        line = re.sub(
+            r"[ \t]+",
+            " ",
+            raw_line,
+        ).strip()
+
+        if not line:
+
+            if (
+                lines
+                and lines[-1] != ""
+            ):
+                lines.append("")
+
+            continue
+
+        lines.append(line)
+
+    while (
+        lines
+        and lines[-1] == ""
+    ):
+        lines.pop()
+
+    return "\n".join(lines)
+
+
+def split_resume_lines(
+    text: str,
+) -> list[str]:
+
+    cleaned = clean_resume_for_pdf(
+        text
+    )
+
+    return cleaned.split("\n")
+
+
+def escape_pdf_text(
+    text: str,
+) -> str:
+
+    return (
+        text
+        .replace("&", "&amp;")
+        .replace("<", "&lt;")
+        .replace(">", "&gt;")
+    )
+
+
+def is_bullet_line(
+    line: str,
+) -> bool:
+
+    return bool(
+        re.match(
+            r"^(?:[•●▪◦‣*-]|\d+[.)])\s+",
+            line.strip(),
+        )
+    )
+
+
+def remove_bullet_marker(
+    line: str,
+) -> str:
+
+    return re.sub(
+        r"^(?:[•●▪◦‣*-]|\d+[.)])\s+",
+        "",
+        line.strip(),
+    )
+
+
+# ---------------------------------------------------------
+# PROFESSIONAL PDF BUILDER
+# ---------------------------------------------------------
+
+def build_professional_pdf(
+    resume_text: str,
+    photo_data: bytes | None = None,
+) -> bytes:
+
+    output = io.BytesIO()
+
+    document = SimpleDocTemplate(
+        output,
+        pagesize=A4,
+        rightMargin=0.58 * inch,
+        leftMargin=0.58 * inch,
+        topMargin=0.48 * inch,
+        bottomMargin=0.50 * inch,
+        title="ResumeAI Professional Resume",
+        author="ResumeAI",
+    )
+
+    styles = getSampleStyleSheet()
+
+    name_style = ParagraphStyle(
+        "ResumeName",
+        parent=styles["Normal"],
+        fontName="Helvetica-Bold",
+        fontSize=21,
+        leading=24,
+        textColor=colors.HexColor(
+            "#172033"
+        ),
+        alignment=TA_LEFT,
+        spaceAfter=5,
+    )
+
+    contact_style = ParagraphStyle(
+        "ResumeContact",
+        parent=styles["Normal"],
+        fontName="Helvetica",
+        fontSize=8.5,
+        leading=11,
+        textColor=colors.HexColor(
+            "#5F6B7A"
+        ),
+        alignment=TA_LEFT,
+        spaceAfter=8,
+    )
+
+    section_style = ParagraphStyle(
+        "ResumeSection",
+        parent=styles["Normal"],
+        fontName="Helvetica-Bold",
+        fontSize=10.5,
+        leading=13,
+        textColor=colors.HexColor(
+            "#173B72"
+        ),
+        spaceBefore=9,
+        spaceAfter=4,
+    )
+
+    body_style = ParagraphStyle(
+        "ResumeBody",
+        parent=styles["Normal"],
+        fontName="Helvetica",
+        fontSize=9.2,
+        leading=13,
+        textColor=colors.HexColor(
+            "#26324A"
+        ),
+        spaceAfter=3,
+    )
+
+    bullet_style = ParagraphStyle(
+        "ResumeBullet",
+        parent=body_style,
+        leftIndent=12,
+        firstLineIndent=-7,
+        spaceAfter=3,
+    )
+
+    from reportlab.platypus import Table, TableStyle
+
+    story = []
+
+    lines = split_resume_lines(
+        resume_text
+    )
+
+    non_empty = [
+        line
+        for line in lines
+        if line.strip()
+    ]
+
+    name = (
+        non_empty[0]
+        if non_empty
+        else "Professional Resume"
+    )
+
+    contact_line = ""
+
+    if len(non_empty) > 1:
+
+        possible_contact = non_empty[1]
+
+        if (
+            "@" in possible_contact
+            or re.search(
+                r"\d{10}",
+                possible_contact,
+            )
+            or "linkedin" in possible_contact.lower()
+            or "github" in possible_contact.lower()
+            or "|" in possible_contact
+        ):
+            contact_line = possible_contact
+
+    # -----------------------------------------------------
+    # HEADER
+    # -----------------------------------------------------
+
+    header_left = [
+        Paragraph(
+            escape_pdf_text(name),
+            name_style,
+        )
+    ]
+
+    if contact_line:
+
+        header_left.append(
+            Paragraph(
+                escape_pdf_text(
+                    contact_line
+                ),
+                contact_style,
+            )
+        )
+
+    # Always reserve the photo area.
+    # If no photo exists, it remains completely blank.
+    if photo_data:
+
+        try:
+
+            photo_stream = prepare_profile_photo(
+                photo_data
+            )
+
+            photo = ReportLabImage(
+                photo_stream,
+                width=0.92 * inch,
+                height=0.92 * inch,
+                kind="proportional",
+            )
+
+            photo_cell = photo
+
+        except Exception as exc:
+
+            print(
+                "Photo rendering error:",
+                repr(exc),
+            )
+
+            photo_cell = Spacer(
+                0.92 * inch,
+                0.92 * inch,
+            )
+
+    else:
+
+        photo_cell = Spacer(
+            0.92 * inch,
+            0.92 * inch,
+        )
+
+    header_table = Table(
+        [
+            [
+                header_left,
+                photo_cell,
+            ]
+        ],
+        colWidths=[
+            6.35 * inch,
+            0.95 * inch,
+        ],
+        rowHeights=[
+            0.95 * inch,
+        ],
+    )
+
+    header_table.setStyle(
+        TableStyle(
+            [
+                (
+                    "VALIGN",
+                    (0, 0),
+                    (-1, -1),
+                    "TOP",
+                ),
+                (
+                    "ALIGN",
+                    (1, 0),
+                    (1, 0),
+                    "RIGHT",
+                ),
+                (
+                    "LEFTPADDING",
+                    (0, 0),
+                    (-1, -1),
+                    0,
+                ),
+                (
+                    "RIGHTPADDING",
+                    (0, 0),
+                    (-1, -1),
+                    0,
+                ),
+                (
+                    "TOPPADDING",
+                    (0, 0),
+                    (-1, -1),
+                    0,
+                ),
+                (
+                    "BOTTOMPADDING",
+                    (0, 0),
+                    (-1, -1),
+                    0,
+                ),
+            ]
+        )
+    )
+
+    story.append(
+        header_table
+    )
+
+    story.append(
+        HRFlowable(
+            width="100%",
+            thickness=1,
+            color=colors.HexColor(
+                "#315BDC"
+            ),
+            spaceBefore=2,
+            spaceAfter=7,
+        )
+    )
+
+    # -----------------------------------------------------
+    # BODY
+    # -----------------------------------------------------
+
+    skip_contact = bool(
+        contact_line
+    )
+
+    for index, line in enumerate(lines):
+
+        stripped = line.strip()
+
+        if not stripped:
+
+            story.append(
+                Spacer(
+                    1,
+                    2,
+                )
+            )
+
+            continue
+
+        if index == 0:
+            continue
+
+        if (
+            skip_contact
+            and index == 1
+        ):
+            continue
+
+        if is_pdf_section_heading(
+            stripped
+        ):
+
+            heading = stripped.upper()
+
+            story.append(
+                Paragraph(
+                    escape_pdf_text(
+                        heading
+                    ),
+                    section_style,
+                )
+            )
+
+            story.append(
+                HRFlowable(
+                    width="100%",
+                    thickness=0.55,
+                    color=colors.HexColor(
+                        "#D5DDEA"
+                    ),
+                    spaceBefore=0,
+                    spaceAfter=4,
+                )
+            )
+
+            continue
+
+        if is_bullet_line(
+            stripped
+        ):
+
+            bullet_text = remove_bullet_marker(
+                stripped
+            )
+
+            story.append(
+                Paragraph(
+                    "• "
+                    + escape_pdf_text(
+                        bullet_text
+                    ),
+                    bullet_style,
+                )
+            )
+
+            continue
+
+        if (
+            " | " in stripped
+            or " — " in stripped
+            or " - " in stripped
+        ):
+
+            story.append(
+                Paragraph(
+                    "<b>"
+                    + escape_pdf_text(
+                        stripped
+                    )
+                    + "</b>",
+                    body_style,
+                )
+            )
+
+        else:
+
+            story.append(
+                Paragraph(
+                    escape_pdf_text(
+                        stripped
+                    ),
+                    body_style,
+                )
+            )
+
+    # -----------------------------------------------------
+    # FOOTER
+    # -----------------------------------------------------
+
+    def draw_footer(
+        canvas,
+        doc,
+    ):
+
+        canvas.saveState()
+
+        canvas.setFont(
+            "Helvetica",
+            7,
+        )
+
+        canvas.setFillColor(
+            colors.HexColor(
+                "#8A94A6"
+            )
+        )
+
+        canvas.drawCentredString(
+            A4[0] / 2,
+            0.27 * inch,
+            "ResumeAI • Professional Resume",
+        )
+
+        canvas.restoreState()
+
+    document.build(
+        story,
+        onFirstPage=draw_footer,
+        onLaterPages=draw_footer,
+    )
+
+    output.seek(0)
+
+    return output.read()
+
+
+def build_final_resume_pdf(
+    resume_text: str,
+    photo_data: bytes | None = None,
+) -> bytes:
+
+    return build_professional_pdf(
+        resume_text,
+        photo_data,
+    )
+
+
+# =========================================================
+# CHECK ORIGINAL RESUME PHOTO
+# =========================================================
+
+@app.post("/enhance-photo-status")
+async def enhance_photo_status(
+    job_id: str = Form(...),
+    resume_file: UploadFile = File(...),
+):
+
+    job = ai_jobs.get(
+        job_id
+    )
+
+    if not job:
+
+        return {
+            "success": False,
+            "message": (
+                "Resume analysis not found. "
+                "Please analyze the resume again."
+            ),
+        }
+
+    try:
+
+        filename = (
+            resume_file.filename
+            or ""
+        )
+
+        data = await resume_file.read()
+
+        if not data:
+
+            return {
+                "success": False,
+                "message": "Resume file is empty.",
+            }
+
+        photo_data = await asyncio.to_thread(
+            extract_embedded_profile_photo,
+            filename,
+            data,
+        )
+
+        return {
+            "success": True,
+            "photo_detected": bool(
+                photo_data
+            ),
+        }
+
+    except Exception as exc:
+
+        print(
+            "Photo status error:",
+            repr(exc),
+        )
+
+        return {
+            "success": False,
+            "message": (
+                "Could not check the original resume photo."
+            ),
+        }
+
+
+# =========================================================
+# ENHANCE API
+# =========================================================
+
+@app.post("/enhance")
+async def enhance_resume(
+    job_id: str = Form(...),
+    resume_file: UploadFile | None = File(None),
+    photo: UploadFile | None = File(None),
+):
+
+    job = ai_jobs.get(
+        job_id
+    )
+
+    if not job:
+
+        return {
+            "success": False,
+            "message": (
+                "Resume analysis not found. "
+                "Please analyze the resume again."
+            ),
+        }
+
+    original_text = job.get(
+        "resume_text"
+    )
+
+    if not original_text:
+
+        return {
+            "success": False,
+            "message": (
+                "Resume text is unavailable. "
+                "Please analyze the resume again."
+            ),
+        }
+
+    try:
+
+        # -------------------------------------------------
+        # ORIGINAL SCORE
+        # -------------------------------------------------
+
+        original_analysis = analyze_resume_text(
+            original_text
+        )
+
+        original_score = int(
+            original_analysis.get(
+                "score",
+                0,
+            )
+        )
+
+        # -------------------------------------------------
+        # AI ENHANCEMENT
+        # -------------------------------------------------
+
+        enhanced_text = await asyncio.to_thread(
+            generate_professional_resume_text,
+            original_text,
+        )
+
+        # -------------------------------------------------
+        # SCORE SAFETY
+        # -------------------------------------------------
+
+        enhanced_analysis = analyze_resume_text(
+            enhanced_text
+        )
+
+        enhanced_score = int(
+            enhanced_analysis.get(
+                "score",
+                0,
+            )
+        )
+
+        # Never return an AI version that scores lower.
+        if enhanced_score < original_score:
+
+            print(
+                "Enhanced resume score dropped:",
+                original_score,
+                "->",
+                enhanced_score,
+            )
+
+            enhanced_text = original_text
+            enhanced_score = original_score
+
+        # -------------------------------------------------
+        # PHOTO
+        # -------------------------------------------------
+
+        photo_data = None
+        photo_source = "none"
+
+        # First priority:
+        # original photo embedded in PDF/DOCX.
+        if resume_file:
+
+            original_filename = (
+                resume_file.filename
+                or ""
+            )
+
+            original_file_data = (
+                await resume_file.read()
+            )
+
+            if original_file_data:
+
+                original_photo = await asyncio.to_thread(
+                    extract_embedded_profile_photo,
+                    original_filename,
+                    original_file_data,
+                )
+
+                if original_photo:
+
+                    photo_data = original_photo
+                    photo_source = "original_resume"
+
+        # Second priority:
+        # user-selected photo, only if original
+        # resume did not already contain one.
+        if (
+            not photo_data
+            and photo
+        ):
+
+            photo_filename = (
+                photo.filename
+                or ""
+            )
+
+            photo_extension = os.path.splitext(
+                photo_filename
+            )[1].lower()
+
+            allowed_photo_extensions = {
+                ".jpg",
+                ".jpeg",
+                ".png",
+            }
+
+            if photo_extension in allowed_photo_extensions:
+
+                uploaded_photo_data = (
+                    await photo.read()
+                )
+
+                validated_photo = (
+                    validate_uploaded_photo(
+                        uploaded_photo_data
+                    )
+                )
+
+                if validated_photo:
+
+                    photo_data = validated_photo
+                    photo_source = "user_uploaded"
+
+        # -------------------------------------------------
+        # BUILD PDF
+        # -------------------------------------------------
+
+        pdf_bytes = await asyncio.to_thread(
+            build_final_resume_pdf,
+            enhanced_text,
+            photo_data,
+        )
+
+        pdf_base64 = base64.b64encode(
+            pdf_bytes
+        ).decode("ascii")
+
+        return {
+            "success": True,
+
+            "enhanced_resume": enhanced_text,
+
+            "original_score": original_score,
+            "enhanced_score": enhanced_score,
+
+            "pdf_base64": pdf_base64,
+
+            "filename": (
+                "ResumeAI-Professional-Resume.pdf"
+            ),
+
+            "photo_included": bool(
+                photo_data
+            ),
+
+            "photo_source": photo_source,
+        }
+
+    except Exception as exc:
+
+        print(
+            "Professional enhance error:",
+            repr(exc),
+        )
+
+        return {
+            "success": False,
+            "message": (
+                "Professional resume generation failed. "
+                "Please try again."
+            ),
+        }
